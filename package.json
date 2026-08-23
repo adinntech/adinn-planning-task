@@ -1,0 +1,15 @@
+{
+  "name": "adinn-planning-task-manager",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ADINN themed Planning Team work allocation and task tracking system.",
+  "scripts": {
+    "install:all": "npm install --prefix backend && npm install --prefix frontend",
+    "dev": "concurrently \"npm run dev --prefix backend\" \"npm run dev --prefix frontend\"",
+    "backend": "npm run dev --prefix backend",
+    "frontend": "npm run dev --prefix frontend"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
