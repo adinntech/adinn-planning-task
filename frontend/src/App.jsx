@@ -165,13 +165,38 @@ function NotificationBell({ onOpenTask, onViewAll, refreshKey, notify }) {
   const [loading, setLoading] = useState(false);
   const [items, setItems] = useState([]);
   const [unreadCount, setUnreadCount] = useState(0);
+  const lastSeenIdRef = useRef(null);
+
+  useEffect(() => {
+    if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+  }, []);
 
   async function load() {
     setLoading(true);
     try {
       const data = await api('/notifications?limit=30');
-      setItems(data.notifications || []);
+      const notifications = data.notifications || [];
+      setItems(notifications);
       setUnreadCount(data.unread_count || 0);
+
+      if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+        const highestId = notifications.reduce((max, item) => Math.max(max, Number(item.id) || 0), 0);
+        if (lastSeenIdRef.current !== null) {
+          notifications
+            .filter(item => Number(item.id) > lastSeenIdRef.current)
+            .forEach(item => {
+              const popup = new Notification(item.title, { body: item.message, tag: `task-notification-${item.id}` });
+              popup.onclick = () => {
+                window.focus();
+                if (item.task_id) onOpenTask(item.task_id);
+                popup.close();
+              };
+            });
+        }
+        if (highestId > 0) lastSeenIdRef.current = highestId;
+      }
     } catch (err) {
       if (notify) notify(err.message, 'error');
     } finally {
@@ -283,6 +308,8 @@ function NotificationsPage({ onOpenTask, notify, refreshKey }) {
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('all');
   const [queryText, setQueryText] = useState('');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
 
   async function load() {
     setLoading(true);
@@ -335,6 +362,8 @@ function NotificationsPage({ onOpenTask, notify, refreshKey }) {
     });
   }, [items, filter, queryText]);
 
+  useEffect(() => { setPage(1); }, [filter, queryText, pageSize]);
+
   return (
     <section className="notifications-page">
       <div className="notifications-page-head">
@@ -369,7 +398,7 @@ function NotificationsPage({ onOpenTask, notify, refreshKey }) {
       <div className="notifications-full-list">
         {loading && items.length === 0 ? <div className="loading-card">Loading notifications...</div> : null}
         {!loading && filteredItems.length === 0 ? <EmptyState title="No notifications found" text="There are no notifications matching this view." /> : null}
-        {filteredItems.map(item => (
+        {paginate(filteredItems, page, pageSize).map(item => (
           <article key={item.id} className={className('notification-full-card', !item.is_read && 'unread')}>
             <div className="notification-full-marker"><Bell size={19} /></div>
             <div className="notification-full-content">
@@ -394,6 +423,7 @@ function NotificationsPage({ onOpenTask, notify, refreshKey }) {
           </article>
         ))}
       </div>
+      <Pagination page={page} pageSize={pageSize} totalItems={filteredItems.length} onPageChange={setPage} onPageSizeChange={setPageSize} />
     </section>
   );
 }
@@ -785,6 +815,65 @@ function PlannerAllocationEditor({ planners, assignments, onChange, disabled = f
   );
 }
 
+function paginate(items, page, pageSize) {
+  const start = (page - 1) * pageSize;
+  return items.slice(start, start + pageSize);
+}
+
+const PAGE_SIZE_OPTIONS = [10, 50, 100];
+
+function Pagination({ page, pageSize, totalItems, onPageChange, onPageSizeChange }) {
+  if (totalItems === 0) return null;
+  const totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
+  const clampedPage = Math.min(Math.max(page, 1), totalPages);
+  return (
+    <div className="pagination-bar">
+      <label className="pagination-size">
+        Show
+        <select value={pageSize} onChange={event => onPageSizeChange(Number(event.target.value))}>
+          {PAGE_SIZE_OPTIONS.map(size => <option key={size} value={size}>{size}</option>)}
+        </select>
+        per page
+      </label>
+      <div className="pagination-controls">
+        <button
+          type="button"
+          className="ghost-button"
+          disabled={clampedPage <= 1}
+          onClick={() => onPageChange(1)}
+        >
+          First
+        </button>
+        <button
+          type="button"
+          className="ghost-button"
+          disabled={clampedPage <= 1}
+          onClick={() => onPageChange(clampedPage - 1)}
+        >
+          Previous
+        </button>
+        <span>Page {clampedPage} of {totalPages}</span>
+        <button
+          type="button"
+          className="ghost-button"
+          disabled={clampedPage >= totalPages}
+          onClick={() => onPageChange(clampedPage + 1)}
+        >
+          Next
+        </button>
+        <button
+          type="button"
+          className="ghost-button"
+          disabled={clampedPage >= totalPages}
+          onClick={() => onPageChange(totalPages)}
+        >
+          Last
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function TaskListTable({
   tasks,
   onOpenTask,
@@ -871,6 +960,8 @@ function TasksPage({ user, onOpenTask, notify, refreshKey, completedOnly = false
   const [creators, setCreators] = useState([]);
   const [loading, setLoading] = useState(true);
   const [filters, setFilters] = useState({ search: '', status: 'all', assigned_to: 'all', assigned_by: 'all', plan_format: 'all', from: '', to: '' });
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
 
   async function load() {
     setLoading(true);
@@ -893,6 +984,7 @@ function TasksPage({ user, onOpenTask, notify, refreshKey, completedOnly = false
   }
 
   useEffect(() => { load(); }, [filters, refreshKey, completedOnly]);
+  useEffect(() => { setPage(1); }, [filters, completedOnly, plannerScope, pageSize]);
 
   const myTasks = user.role === 'planner'
     ? tasks.filter(task => {
@@ -952,7 +1044,12 @@ function TasksPage({ user, onOpenTask, notify, refreshKey, completedOnly = false
               </div>
               {otherTasks.length === 0
                 ? <EmptyState title="No other company tasks found" text="Adjust the filters or refresh this page." />
-                : <TaskListTable tasks={otherTasks} onOpenTask={onOpenTask} summaryOnly completedOnly={completedOnly} user={user} onConversionChange={updateConversionStatus} />}
+                : (
+                  <>
+                    <TaskListTable tasks={paginate(otherTasks, page, pageSize)} onOpenTask={onOpenTask} summaryOnly completedOnly={completedOnly} user={user} onConversionChange={updateConversionStatus} />
+                    <Pagination page={page} pageSize={pageSize} totalItems={otherTasks.length} onPageChange={setPage} onPageSizeChange={setPageSize} />
+                  </>
+                )}
             </section>
           ) : (
             <section className="task-list-section">
@@ -965,7 +1062,12 @@ function TasksPage({ user, onOpenTask, notify, refreshKey, completedOnly = false
               </div>
               {myTasks.length === 0
                 ? <EmptyState title={completedOnly ? 'No completed tasks assigned to you' : 'No tasks assigned to you'} text="Your assigned planning tasks will appear here." />
-                : <TaskListTable tasks={myTasks} onOpenTask={onOpenTask} completedOnly={completedOnly} user={user} onConversionChange={updateConversionStatus} />}
+                : (
+                  <>
+                    <TaskListTable tasks={paginate(myTasks, page, pageSize)} onOpenTask={onOpenTask} completedOnly={completedOnly} user={user} onConversionChange={updateConversionStatus} />
+                    <Pagination page={page} pageSize={pageSize} totalItems={myTasks.length} onPageChange={setPage} onPageSizeChange={setPageSize} />
+                  </>
+                )}
             </section>
           )}
         </div>
@@ -975,7 +1077,10 @@ function TasksPage({ user, onOpenTask, notify, refreshKey, completedOnly = false
           text={completedOnly ? 'Tasks marked Completed will appear in this section.' : 'Create a new request or adjust your filters.'}
         />
       ) : (
-        <TaskListTable tasks={tasks} onOpenTask={onOpenTask} completedOnly={completedOnly} user={user} onConversionChange={updateConversionStatus} />
+        <>
+          <TaskListTable tasks={paginate(tasks, page, pageSize)} onOpenTask={onOpenTask} completedOnly={completedOnly} user={user} onConversionChange={updateConversionStatus} />
+          <Pagination page={page} pageSize={pageSize} totalItems={tasks.length} onPageChange={setPage} onPageSizeChange={setPageSize} />
+        </>
       )}
     </section>
   );

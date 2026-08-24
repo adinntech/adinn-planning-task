@@ -926,23 +926,21 @@ app.get('/api/tasks', requireAuth, asyncHandler(async (req, res) => {
   let tasks = await attachTaskDetailsBatch(taskDocs, assignmentsByTask);
 
   if (view === 'completed') {
-    if (req.user.role === 'planner') {
-      tasks.sort((a, b) => {
-        const aOwn = (assignmentsByTask.get(Number(a.id)) || []).find(x => Number(x.planner_id) === Number(req.user.id));
-        const bOwn = (assignmentsByTask.get(Number(b.id)) || []).find(x => Number(x.planner_id) === Number(req.user.id));
-        const aKey = aOwn?.completed_at || a.completed_at || a.updated_at || a.created_at || '';
-        const bKey = bOwn?.completed_at || b.completed_at || b.updated_at || b.created_at || '';
-        if (aKey !== bKey) return aKey < bKey ? 1 : -1;
-        return Number(b.id) - Number(a.id);
-      });
-    } else {
-      tasks.sort((a, b) => {
-        const aKey = a.completed_at || a.updated_at || a.created_at || '';
-        const bKey = b.completed_at || b.updated_at || b.created_at || '';
-        if (aKey !== bKey) return aKey < bKey ? 1 : -1;
-        return Number(b.id) - Number(a.id);
-      });
-    }
+    // Newest submission deadline first (matches the "Submission Deadline" column
+    // shown on the Completed page), falling back to completion/update time when
+    // a task has no deadline recorded. Legacy records store this in inconsistent
+    // date-string formats, so compare actual parsed timestamps rather than raw
+    // strings (lexicographic comparison silently breaks on mixed formats).
+    const sortTimestamp = (value) => {
+      const parsed = value ? new Date(value).getTime() : NaN;
+      return Number.isNaN(parsed) ? -Infinity : parsed;
+    };
+    tasks.sort((a, b) => {
+      const aKey = sortTimestamp(effectiveDeadline(a) || a.completed_at || a.updated_at || a.created_at);
+      const bKey = sortTimestamp(effectiveDeadline(b) || b.completed_at || b.updated_at || b.created_at);
+      if (aKey !== bKey) return bKey - aKey;
+      return Number(b.id) - Number(a.id);
+    });
   } else {
     tasks.sort((a, b) => {
       const pr = priorityRank(a.priority) - priorityRank(b.priority);

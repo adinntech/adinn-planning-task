@@ -67,6 +67,12 @@ input:focus, select:focus, textarea:focus { border-color: rgba(237,0,16,.7); box
 .ghost-button { background: #fff; color: var(--text); border: 1px solid var(--panel-line); box-shadow: 0 8px 22px rgba(15,23,42,.05); }
 .ghost-button:hover { background: #f8fafc; }
 .danger-button { background: rgba(237,0,16,.08); color: var(--red-dark); border: 1px solid rgba(237,0,16,.24); }
+.pagination-bar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px; margin-top: 18px; font-weight: 700; color: var(--text-soft, #64748b); }
+.pagination-size { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; }
+.pagination-size select { border-radius: 10px; border: 1px solid var(--panel-line); padding: 6px 10px; font-weight: 700; }
+.pagination-controls { display: flex; align-items: center; gap: 16px; margin-left: auto; }
+.pagination-bar .ghost-button { min-height: 38px; padding: 0 16px; }
+.pagination-bar .ghost-button:disabled { opacity: .45; cursor: not-allowed; }
 .demo-buttons { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
 .demo-buttons button { border: 1px solid var(--panel-line); background: #fff; color: var(--text); border-radius: 12px; padding: 12px; font-weight: 800; box-shadow: 0 8px 20px rgba(15,23,42,.05); }
 .demo-buttons button:hover, .demo-buttons button.selected { border-color: rgba(237,0,16,.35); color: var(--red-dark); background: rgba(237,0,16,.06); box-shadow: 0 10px 24px rgba(237,0,16,.10); }
