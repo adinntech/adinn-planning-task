@@ -1,6 +1,5 @@
 const path = require('path');
 const fs = require('fs');
-const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -8,47 +7,45 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const ExcelJS = require('exceljs');
-const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
 const {
+  mongoose,
   initDb,
   now,
   hashPassword,
   addHistory,
   generateTaskCode,
-  one,
-  many,
-  query,
-  withTransaction
+  withTransaction,
+  nextId,
+  User,
+  Task,
+  TaskPlannerAssignment,
+  TaskComment,
+  TaskFile,
+  TaskStatusHistory,
+  TaskDecline,
+  Notification
 } = require('./database');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
 const JWT_SECRET = process.env.JWT_SECRET || 'local-dev-secret-change-me';
-const SUPABASE_URL = String(process.env.SUPABASE_URL || '').trim();
-const SUPABASE_SECRET_KEY = String(
-  process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || ''
-).trim();
-const SUPABASE_STORAGE_BUCKET = String(
-  process.env.SUPABASE_STORAGE_BUCKET || 'planning-task-attachments'
-).trim();
-const SUPABASE_SIGNED_URL_SECONDS = Math.min(
-  Math.max(Number(process.env.SUPABASE_SIGNED_URL_SECONDS) || 3600, 60),
+const FILE_TOKEN_SECRET = process.env.FILE_TOKEN_SECRET || JWT_SECRET;
+const FILE_LINK_SECONDS = Math.min(
+  Math.max(Number(process.env.FILE_LINK_SECONDS || process.env.SUPABASE_SIGNED_URL_SECONDS) || 3600, 60),
   86400
 );
 const uploadDir = path.resolve(process.cwd(), process.env.UPLOAD_DIR || './uploads');
 fs.mkdirSync(uploadDir, { recursive: true });
 
-const supabase = SUPABASE_URL && SUPABASE_SECRET_KEY
-  ? createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
-      auth: {
-        persistSession: false,
-        autoRefreshToken: false,
-        detectSessionInUrl: false
-      }
-    })
-  : null;
+let gridFsBucket = null;
+function getGridFsBucket() {
+  if (!gridFsBucket) {
+    gridFsBucket = new mongoose.mongo.GridFSBucket(mongoose.connection.db, { bucketName: 'task_attachments' });
+  }
+  return gridFsBucket;
+}
 
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors({ origin: process.env.CORS_ORIGIN || 'http://localhost:5173', credentials: true }));
@@ -89,14 +86,10 @@ async function removeLocalUpload(filePath) {
   }
 }
 
-function storageBucket() {
-  if (!supabase) {
-    throw new Error(
-      'Supabase Storage is not configured. Add SUPABASE_URL and SUPABASE_SECRET_KEY to the backend environment.'
-    );
-  }
-  return supabase.storage.from(SUPABASE_STORAGE_BUCKET);
-}
+// ---------------------------------------------------------------------------
+// File storage (MongoDB GridFS, replacing Supabase Storage / falling back to
+// the local disk copy for older records created before this migration)
+// ---------------------------------------------------------------------------
 
 function safeStorageFileName(originalName) {
   const extension = path.extname(originalName || '').replace(/[^a-zA-Z0-9.]/g, '').slice(0, 20);
@@ -108,43 +101,38 @@ function safeStorageFileName(originalName) {
   return `${baseName}${extension}`;
 }
 
-function storageObjectPath(taskId, originalName) {
-  return `tasks/${taskId}/${Date.now()}-${crypto.randomUUID()}-${safeStorageFileName(originalName)}`;
-}
-
-async function uploadSupabaseFile(taskId, file) {
-  const objectPath = storageObjectPath(taskId, file.originalname);
-  const fileBody = await fs.promises.readFile(file.path);
-  const { error } = await storageBucket().upload(objectPath, fileBody, {
-    contentType: file.mimetype || 'application/octet-stream',
-    cacheControl: '3600',
-    upsert: false
+async function uploadGridFsFile(file) {
+  const bucket = getGridFsBucket();
+  const filename = safeStorageFileName(file.originalname);
+  return new Promise((resolve, reject) => {
+    const uploadStream = bucket.openUploadStream(filename, {
+      contentType: file.mimetype || 'application/octet-stream'
+    });
+    fs.createReadStream(file.path)
+      .on('error', reject)
+      .pipe(uploadStream)
+      .on('error', reject)
+      .on('finish', () => resolve(uploadStream.id));
   });
-  if (error) throw new Error(`Unable to upload ${file.originalname}: ${error.message}`);
-  return objectPath;
 }
 
-async function createSupabaseDownloadUrl(file) {
-  const { data, error } = await storageBucket().createSignedUrl(
-    file.file_path,
-    SUPABASE_SIGNED_URL_SECONDS,
-    { download: file.file_name }
-  );
-  if (error || !data?.signedUrl) {
-    throw new Error(`Unable to create download link for ${file.file_name}: ${error?.message || 'Unknown storage error'}`);
+async function removeGridFsFile(gridfsId, throwOnError = true) {
+  if (!gridfsId) return;
+  try {
+    await getGridFsBucket().delete(new mongoose.Types.ObjectId(gridfsId));
+  } catch (error) {
+    if (throwOnError) throw new Error(`Unable to delete stored file: ${error.message}`);
+    console.error('Unable to clean up GridFS file', error);
   }
-  return data.signedUrl;
 }
 
-async function createSupabasePreviewUrl(file) {
-  const { data, error } = await storageBucket().createSignedUrl(
-    file.file_path,
-    SUPABASE_SIGNED_URL_SECONDS
-  );
-  if (error || !data?.signedUrl) {
-    throw new Error(`Unable to create preview link for ${file.file_name}: ${error?.message || 'Unknown storage error'}`);
-  }
-  return data.signedUrl;
+function signFileToken(fileId, mode) {
+  return jwt.sign({ fileId: String(fileId), mode }, FILE_TOKEN_SECRET, { expiresIn: FILE_LINK_SECONDS });
+}
+
+function fileLink(fileId, mode) {
+  const token = signFileToken(fileId, mode);
+  return `/files/${fileId}?mode=${mode}&token=${encodeURIComponent(token)}`;
 }
 
 function localStoredFilePath(file) {
@@ -163,22 +151,8 @@ async function attachmentResponse(file) {
           ? 'presentation'
           : 'browser';
 
-  if (file.storage_provider === 'supabase') {
-    try {
-      const [downloadUrl, previewUrl] = await Promise.all([
-        createSupabaseDownloadUrl(file),
-        createSupabasePreviewUrl(file)
-      ]);
-      return {
-        ...file,
-        available: true,
-        preview_kind: previewKind,
-        preview_url: previewUrl,
-        download_url: downloadUrl,
-        url: downloadUrl
-      };
-    } catch (error) {
-      console.error(`Unable to prepare Supabase attachment ${file.id}`, error);
+  if (file.storage_provider === 'gridfs') {
+    if (!file.gridfs_id) {
       return {
         ...file,
         available: false,
@@ -189,6 +163,16 @@ async function attachmentResponse(file) {
         unavailable_reason: 'Stored file is unavailable. Please re-upload it.'
       };
     }
+    const downloadUrl = fileLink(file.gridfs_id, 'download');
+    const previewUrl = fileLink(file.gridfs_id, 'preview');
+    return {
+      ...file,
+      available: true,
+      preview_kind: previewKind,
+      preview_url: previewUrl,
+      download_url: downloadUrl,
+      url: downloadUrl
+    };
   }
 
   const exists = Boolean(file.file_path) && fs.existsSync(localStoredFilePath(file));
@@ -200,54 +184,26 @@ async function attachmentResponse(file) {
     preview_url: localUrl,
     download_url: localUrl,
     url: localUrl,
-    unavailable_reason: exists ? null : 'Old Render file is unavailable. Please re-upload it.'
+    unavailable_reason: exists ? null : 'Old file is unavailable. Please re-upload it.'
   };
-}
-
-async function removeSupabaseObjects(paths, throwOnError = true) {
-  const uniquePaths = [...new Set((paths || []).filter(Boolean))];
-  if (uniquePaths.length === 0) return;
-  const { error } = await storageBucket().remove(uniquePaths);
-  if (error) {
-    if (throwOnError) throw new Error(`Unable to delete stored file: ${error.message}`);
-    console.error('Unable to clean up Supabase Storage objects', error);
-  }
 }
 
 async function removeStoredFile(file, throwOnError = true) {
   if (!file) return;
-  if (file.storage_provider === 'supabase') {
-    await removeSupabaseObjects([file.file_path], throwOnError);
+  if (file.storage_provider === 'gridfs') {
+    await removeGridFsFile(file.gridfs_id, throwOnError);
     return;
   }
   await removeLocalUpload(file.file_path);
 }
 
 async function removeStoredFilesBestEffort(files) {
-  const supabasePaths = (files || [])
-    .filter(file => file.storage_provider === 'supabase')
-    .map(file => file.file_path);
-  await removeSupabaseObjects(supabasePaths, false);
-  await Promise.all(
-    (files || [])
-      .filter(file => file.storage_provider !== 'supabase')
-      .map(file => removeLocalUpload(file.file_path))
-  );
+  await Promise.all((files || []).map(file => removeStoredFile(file, false)));
 }
 
-async function validateSupabaseStorage() {
-  if (!supabase) {
-    throw new Error(
-      'Supabase Storage is not configured. Add SUPABASE_URL and SUPABASE_SECRET_KEY to Render before deploying.'
-    );
-  }
-  const { data, error } = await supabase.storage.getBucket(SUPABASE_STORAGE_BUCKET);
-  if (error || !data) {
-    throw new Error(
-      `Supabase Storage bucket "${SUPABASE_STORAGE_BUCKET}" is unavailable. Create it as a private bucket and verify the backend secret key.`
-    );
-  }
-}
+// ---------------------------------------------------------------------------
+// Generic helpers
+// ---------------------------------------------------------------------------
 
 const STATUSES = [
   'Pending Lead Assignment',
@@ -264,6 +220,29 @@ const STATUSES = [
 
 function asyncHandler(fn) {
   return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+}
+
+function toPlainId(doc) {
+  if (!doc) return doc;
+  const { _id, __v, ...rest } = doc;
+  return { id: _id, ...rest };
+}
+
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function joinUserFields(rows, idField, fields) {
+  if (!rows.length) return [];
+  const ids = uniqueIds(rows.map(r => r[idField]));
+  const users = ids.length ? await User.find({ _id: { $in: ids } }).select(fields.join(' ')).lean() : [];
+  const map = new Map(users.map(u => [Number(u._id), u]));
+  return rows.map(r => {
+    const u = map.get(Number(r[idField])) || {};
+    const extra = {};
+    for (const f of fields) extra[f] = u[f] ?? null;
+    return { ...toPlainId(r), ...extra };
+  });
 }
 
 function publicUser(row) {
@@ -292,9 +271,9 @@ async function requireAuth(req, res, next) {
   if (!token) return res.status(401).json({ message: 'Missing authorization token' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = await one('SELECT * FROM users WHERE id = $1', [payload.id]);
+    const user = await User.findById(payload.id).lean();
     if (!user || user.status !== 'active') return res.status(401).json({ message: 'User is not active' });
-    req.user = user;
+    req.user = toPlainId(user);
     next();
   } catch (error) {
     return res.status(401).json({ message: 'Invalid or expired token' });
@@ -324,56 +303,6 @@ function canViewTask(user, task) {
   return false;
 }
 
-async function fetchTask(id) {
-  return one(`
-    SELECT t.*,
-      assigner.name AS assigned_by_name,
-      assigner.email AS assigned_by_email,
-      assigner.role AS assigned_by_role,
-      planner.name AS assigned_to_name,
-      planner.email AS assigned_to_email,
-      planner.role AS assigned_to_role,
-      lead.name AS planning_lead_name,
-      lead.email AS planning_lead_email,
-      ARRAY(
-        SELECT a.planner_id
-        FROM task_planner_assignments a
-        WHERE a.task_id = t.id
-        ORDER BY a.id
-      ) AS planner_ids,
-      COALESCE((
-        SELECT string_agg(u.name, ', ' ORDER BY a.id)
-        FROM task_planner_assignments a
-        JOIN users u ON u.id = a.planner_id
-        WHERE a.task_id = t.id
-      ), '') AS assigned_planner_names,
-      (SELECT COUNT(*)::int FROM task_planner_assignments a WHERE a.task_id = t.id) AS planner_count,
-      (SELECT COUNT(*)::int FROM task_planner_assignments a WHERE a.task_id = t.id AND a.status = 'Completed') AS planner_completed_count,
-      COALESCE((
-        SELECT json_agg(json_build_object(
-          'planner_id', a.planner_id,
-          'status', a.status,
-          'assigned_locations', a.assigned_locations
-        ) ORDER BY a.id)
-        FROM task_planner_assignments a
-        WHERE a.task_id = t.id
-      ), '[]'::json) AS planner_assignments_summary
-    FROM tasks t
-    JOIN users assigner ON assigner.id = t.assigned_by
-    JOIN users planner ON planner.id = t.assigned_to
-    LEFT JOIN users lead ON lead.id = t.planning_lead_id
-    WHERE t.id = $1
-  `, [id]);
-}
-
-async function addComment(taskId, userId, comment) {
-  if (!comment || !comment.trim()) return;
-  await query(
-    'INSERT INTO task_comments (task_id, user_id, comment, created_at) VALUES ($1, $2, $3, $4)',
-    [taskId, userId, comment.trim(), now()]
-  );
-}
-
 function uniqueIds(ids = []) {
   return Array.from(new Set(ids.map(id => Number(id)).filter(id => Number.isFinite(id) && id > 0)));
 }
@@ -385,11 +314,17 @@ function taskDisplayName(task) {
 
 async function createNotification(userId, taskId, title, message, type = 'task_update') {
   if (!userId) return;
-  await query(
-    `INSERT INTO notifications (user_id, task_id, title, message, type, is_read, created_at)
-     VALUES ($1, $2, $3, $4, $5, FALSE, $6)`,
-    [userId, taskId || null, title, message, type, now()]
-  );
+  const id = await nextId('notifications');
+  await Notification.create({
+    _id: id,
+    user_id: userId,
+    task_id: taskId || null,
+    title,
+    message,
+    type,
+    is_read: false,
+    created_at: now()
+  });
 }
 
 async function notifyUsers(userIds, taskId, title, message, type = 'task_update', excludeUserId = null) {
@@ -408,14 +343,103 @@ function taskParticipantIds(task) {
   ]);
 }
 
+async function addComment(taskId, userId, comment) {
+  if (!comment || !comment.trim()) return;
+  const id = await nextId('task_comments');
+  await TaskComment.create({
+    _id: id,
+    task_id: taskId,
+    user_id: userId,
+    comment: comment.trim(),
+    created_at: now()
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Task read helpers (replace the correlated-subquery SQL in fetchTask / the
+// task-list query with batched lookups + in-app joins)
+// ---------------------------------------------------------------------------
+
+async function fetchAssignmentsForTasks(taskIds) {
+  const map = new Map();
+  if (!taskIds.length) return map;
+  const assignments = await TaskPlannerAssignment.find({ task_id: { $in: taskIds } }).sort({ _id: 1 }).lean();
+  for (const a of assignments) {
+    const key = Number(a.task_id);
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(a);
+  }
+  return map;
+}
+
+async function attachTaskDetailsBatch(taskDocs, assignmentsByTask) {
+  const tasks = taskDocs.map(t => (t.toObject ? t.toObject() : t));
+  if (tasks.length === 0) return [];
+  const relatedUserIds = uniqueIds(tasks.flatMap(t => [t.assigned_by, t.assigned_to, t.planning_lead_id]));
+  const allAssignments = [...assignmentsByTask.values()].flat();
+  const plannerIds = uniqueIds(allAssignments.map(a => a.planner_id));
+  const allUserIds = uniqueIds([...relatedUserIds, ...plannerIds]);
+  const users = allUserIds.length
+    ? await User.find({ _id: { $in: allUserIds } }).select('name email role verticals').lean()
+    : [];
+  const userMap = new Map(users.map(u => [Number(u._id), u]));
+
+  return tasks.map(task => {
+    const taskAssignments = assignmentsByTask.get(Number(task.id)) || [];
+    const assigner = userMap.get(Number(task.assigned_by));
+    const planner = userMap.get(Number(task.assigned_to));
+    const lead = task.planning_lead_id ? userMap.get(Number(task.planning_lead_id)) : null;
+    const plannerIdsForTask = taskAssignments.map(a => Number(a.planner_id));
+    const assignedPlannerNames = taskAssignments
+      .map(a => userMap.get(Number(a.planner_id))?.name)
+      .filter(Boolean)
+      .join(', ');
+    return {
+      ...task,
+      assigned_by_name: assigner?.name || null,
+      assigned_by_email: assigner?.email || null,
+      assigned_by_role: assigner?.role || null,
+      assigned_to_name: planner?.name || null,
+      assigned_to_email: planner?.email || null,
+      assigned_to_role: planner?.role || null,
+      planning_lead_name: lead?.name || null,
+      planning_lead_email: lead?.email || null,
+      planner_ids: plannerIdsForTask,
+      assigned_planner_names: assignedPlannerNames,
+      planner_count: taskAssignments.length,
+      planner_completed_count: taskAssignments.filter(a => a.status === 'Completed').length,
+      planner_assignments_summary: taskAssignments.map(a => ({
+        planner_id: a.planner_id,
+        status: a.status,
+        assigned_locations: a.assigned_locations
+      }))
+    };
+  });
+}
+
+async function fetchTask(id) {
+  const task = await Task.findById(id);
+  if (!task) return null;
+  const assignmentsByTask = await fetchAssignmentsForTasks([task._id]);
+  const [attached] = await attachTaskDetailsBatch([task], assignmentsByTask);
+  return attached;
+}
+
 async function fetchPlannerAssignments(taskId) {
-  return many(`
-    SELECT a.*, u.name AS planner_name, u.email AS planner_email, u.verticals AS planner_verticals
-    FROM task_planner_assignments a
-    JOIN users u ON u.id = a.planner_id
-    WHERE a.task_id = $1
-    ORDER BY a.id
-  `, [taskId]);
+  const assignments = await TaskPlannerAssignment.find({ task_id: taskId }).sort({ _id: 1 }).lean();
+  if (!assignments.length) return [];
+  const plannerIds = uniqueIds(assignments.map(a => a.planner_id));
+  const planners = await User.find({ _id: { $in: plannerIds } }).select('name email verticals').lean();
+  const plannerMap = new Map(planners.map(u => [Number(u._id), u]));
+  return assignments.map(a => {
+    const p = plannerMap.get(Number(a.planner_id));
+    return {
+      ...toPlainId(a),
+      planner_name: p?.name || null,
+      planner_email: p?.email || null,
+      planner_verticals: p?.verticals || ''
+    };
+  });
 }
 
 function overallTaskStatus(assignments) {
@@ -429,30 +453,32 @@ function overallTaskStatus(assignments) {
   return 'Pending Acceptance';
 }
 
-async function syncTaskFromPlannerAssignments(taskId, tx = null) {
-  const db = tx || { one, many, query };
-  const assignments = await db.many(`
-    SELECT * FROM task_planner_assignments
-    WHERE task_id = $1
-    ORDER BY id
-  `, [taskId]);
-  const task = await db.one('SELECT * FROM tasks WHERE id = $1', [taskId]);
+async function syncTaskFromPlannerAssignments(taskId, session = null) {
+  const assignmentsQuery = TaskPlannerAssignment.find({ task_id: taskId }).sort({ _id: 1 });
+  if (session) assignmentsQuery.session(session);
+  const assignments = await assignmentsQuery.lean();
+
+  const taskQuery = Task.findById(taskId);
+  if (session) taskQuery.session(session);
+  const task = await taskQuery;
   if (!task) return null;
 
   const nextStatus = overallTaskStatus(assignments);
   const firstPlannerId = assignments[0]?.planner_id || task.planning_lead_id || task.assigned_to;
   const timestamp = now();
-  await db.query(`
-    UPDATE tasks
-    SET assigned_to = $1,
-        status = $2,
-        accepted_at = CASE WHEN $2 IN ('Accepted', 'In Progress', 'Waiting for Details', 'Completed') THEN COALESCE(accepted_at, $3) ELSE accepted_at END,
-        declined_at = CASE WHEN $2 = 'Declined' THEN $3 ELSE NULL END,
-        completed_at = CASE WHEN $2 = 'Completed' THEN $3 ELSE NULL END,
-        updated_at = $3
-    WHERE id = $4
-  `, [firstPlannerId, nextStatus, timestamp, taskId]);
-  return { oldStatus: task.status, newStatus: nextStatus, assignments };
+  const oldStatus = task.status;
+
+  task.assigned_to = firstPlannerId;
+  task.status = nextStatus;
+  if (['Accepted', 'In Progress', 'Waiting for Details', 'Completed'].includes(nextStatus)) {
+    task.accepted_at = task.accepted_at || timestamp;
+  }
+  task.declined_at = nextStatus === 'Declined' ? timestamp : null;
+  task.completed_at = nextStatus === 'Completed' ? timestamp : null;
+  task.updated_at = timestamp;
+  await task.save(session ? { session } : undefined);
+
+  return { oldStatus, newStatus: nextStatus, assignments };
 }
 
 function normalizePlannerAssignments(input) {
@@ -470,6 +496,25 @@ function normalizePlannerAssignments(input) {
   }
   return normalized;
 }
+
+// ---------------------------------------------------------------------------
+// Cascading deletes (MongoDB has no FK cascade, so this replaces what
+// Postgres's ON DELETE CASCADE used to do implicitly)
+// ---------------------------------------------------------------------------
+
+async function deleteTaskCascade(taskId, session) {
+  await TaskPlannerAssignment.deleteMany({ task_id: taskId }).session(session);
+  await TaskComment.deleteMany({ task_id: taskId }).session(session);
+  await TaskFile.deleteMany({ task_id: taskId }).session(session);
+  await TaskStatusHistory.deleteMany({ task_id: taskId }).session(session);
+  await TaskDecline.deleteMany({ task_id: taskId }).session(session);
+  await Notification.deleteMany({ task_id: taskId }).session(session);
+  await Task.deleteOne({ _id: taskId }).session(session);
+}
+
+// ---------------------------------------------------------------------------
+// Reports helpers
+// ---------------------------------------------------------------------------
 
 const REPORT_TIME_ZONE = String(process.env.REPORT_TIME_ZONE || 'Asia/Kolkata').trim() || 'Asia/Kolkata';
 
@@ -554,27 +599,92 @@ function buildDescription(body) {
   return text(body.additional_specifications);
 }
 
-function deadlineDateExpression(alias = '') {
-  const prefix = alias ? `${alias}.` : '';
-  return `CAST(COALESCE(NULLIF(${prefix}submission_deadline, ''), NULLIF(${prefix}due_date, '')) AS DATE)`;
+function priorityRank(priority) {
+  return priority === 'Urgent' ? 0 : priority === 'High' ? 1 : priority === 'Medium' ? 2 : 3;
 }
 
+function effectiveDeadline(task) {
+  return task.submission_deadline || task.due_date || '';
+}
+
+function deadlineExpr() {
+  return {
+    $cond: [
+      { $and: [{ $ne: ['$submission_deadline', null] }, { $ne: ['$submission_deadline', ''] }] },
+      '$submission_deadline',
+      '$due_date'
+    ]
+  };
+}
+
+async function buildVisibilityFilter(user) {
+  if (user.role === 'manager') return { assigned_by: user.id };
+  if (user.role === 'planning_lead') {
+    return { $or: [{ planning_lead_id: user.id }, { assigned_to: user.id }, { assigned_by: user.id }] };
+  }
+  if (user.role === 'planner') {
+    const taskIds = await TaskPlannerAssignment.find({ planner_id: user.id }).distinct('task_id');
+    return { _id: { $in: taskIds } };
+  }
+  return {};
+}
+
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, app: 'ADINN Planning Task Manager', database: 'postgresql', time: now() });
+  res.json({ ok: true, app: 'ADINN Planning Task Manager', database: 'mongodb', time: now() });
 });
 
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, app: 'ADINN Planning Task Manager', database: 'postgresql', time: now() });
+  res.json({ ok: true, app: 'ADINN Planning Task Manager', database: 'mongodb', time: now() });
 });
+
+app.get('/files/:fileId', asyncHandler(async (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(401).json({ message: 'Missing file access token' });
+  let payload;
+  try {
+    payload = jwt.verify(token, FILE_TOKEN_SECRET);
+  } catch (error) {
+    return res.status(401).json({ message: 'Invalid or expired file link' });
+  }
+  if (String(payload.fileId) !== String(req.params.fileId)) {
+    return res.status(401).json({ message: 'Invalid file link' });
+  }
+  const mode = payload.mode === 'preview' ? 'preview' : 'download';
+
+  let objectId;
+  try {
+    objectId = new mongoose.Types.ObjectId(req.params.fileId);
+  } catch (error) {
+    return res.status(404).json({ message: 'File not found' });
+  }
+  const fileDoc = await TaskFile.findOne({ gridfs_id: objectId }).lean();
+  if (!fileDoc) return res.status(404).json({ message: 'File not found' });
+
+  res.setHeader('Content-Type', fileDoc.file_type || 'application/octet-stream');
+  res.setHeader(
+    'Content-Disposition',
+    `${mode === 'download' ? 'attachment' : 'inline'}; filename="${encodeURIComponent(fileDoc.file_name)}"`
+  );
+  const downloadStream = getGridFsBucket().openDownloadStream(objectId);
+  downloadStream.on('error', () => {
+    if (!res.headersSent) res.status(404).json({ message: 'File not found' });
+  });
+  downloadStream.pipe(res);
+}));
 
 app.post('/api/auth/login', asyncHandler(async (req, res) => {
   const { email, password } = req.body;
-  const user = await one('SELECT * FROM users WHERE email = $1', [String(email || '').toLowerCase()]);
+  const user = await User.findOne({ email: String(email || '').toLowerCase() });
   if (!user || !bcrypt.compareSync(password || '', user.password_hash)) {
     return res.status(401).json({ message: 'Invalid email or password' });
   }
   if (user.status !== 'active') return res.status(403).json({ message: 'This account is inactive' });
-  res.json({ token: signToken(user), user: publicUser(user) });
+  const plain = user.toObject();
+  res.json({ token: signToken(plain), user: publicUser(plain) });
 }));
 
 app.get('/api/auth/me', requireAuth, asyncHandler(async (req, res) => {
@@ -583,49 +693,51 @@ app.get('/api/auth/me', requireAuth, asyncHandler(async (req, res) => {
 
 app.get('/api/notifications', requireAuth, asyncHandler(async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit || 40), 1), 500);
-  const notifications = await many(`
-    SELECT n.*, t.task_code, t.brand_name, t.title AS task_title, t.status AS task_status
-    FROM notifications n
-    LEFT JOIN tasks t ON t.id = n.task_id
-    WHERE n.user_id = $1
-    ORDER BY n.created_at DESC
-    LIMIT $2
-  `, [req.user.id, limit]);
-  const unread = await one('SELECT COUNT(*)::int AS count FROM notifications WHERE user_id = $1 AND is_read = FALSE', [req.user.id]);
-  res.json({ notifications, unread_count: unread?.count || 0 });
+  const rows = await Notification.find({ user_id: req.user.id }).sort({ created_at: -1 }).limit(limit).lean();
+  const taskIds = uniqueIds(rows.map(r => r.task_id).filter(Boolean));
+  const tasks = taskIds.length
+    ? await Task.find({ _id: { $in: taskIds } }).select('task_code brand_name title status').lean()
+    : [];
+  const taskMap = new Map(tasks.map(t => [Number(t._id), t]));
+  const notifications = rows.map(r => {
+    const t = r.task_id ? taskMap.get(Number(r.task_id)) : null;
+    return {
+      ...toPlainId(r),
+      task_code: t?.task_code || null,
+      brand_name: t?.brand_name || null,
+      task_title: t?.title || null,
+      task_status: t?.status || null
+    };
+  });
+  const unreadCount = await Notification.countDocuments({ user_id: req.user.id, is_read: false });
+  res.json({ notifications, unread_count: unreadCount });
 }));
 
 app.patch('/api/notifications/:id/read', requireAuth, asyncHandler(async (req, res) => {
-  await query('UPDATE notifications SET is_read = TRUE WHERE id = $1 AND user_id = $2', [Number(req.params.id), req.user.id]);
+  await Notification.updateOne({ _id: Number(req.params.id), user_id: req.user.id }, { $set: { is_read: true } });
   res.json({ message: 'Notification marked as read' });
 }));
 
 app.patch('/api/notifications/read-all', requireAuth, asyncHandler(async (req, res) => {
-  await query('UPDATE notifications SET is_read = TRUE WHERE user_id = $1 AND is_read = FALSE', [req.user.id]);
+  await Notification.updateMany({ user_id: req.user.id, is_read: false }, { $set: { is_read: true } });
   res.json({ message: 'Notifications marked as read' });
 }));
 
 app.get('/api/users', requireAuth, asyncHandler(async (req, res) => {
   const { role, status = 'active' } = req.query;
-  const values = [];
-  const where = [];
-
-  if (role) {
-    values.push(role);
-    where.push(`role = $${values.length}`);
-  }
-  if (status !== 'all') {
-    values.push(status);
-    where.push(`status = $${values.length}`);
-  }
+  const filter = {};
+  if (role) filter.role = role;
+  if (status !== 'all') filter.status = status;
 
   if (req.user.role === 'planner') {
-    values.push(req.user.id);
-    where.push(`(role IN ('manager', 'planning_lead', 'admin') OR id = $${values.length})`);
+    filter.$or = [
+      { role: { $in: ['manager', 'planning_lead', 'admin'] } },
+      { _id: req.user.id }
+    ];
   }
 
-  const rows = await many(`SELECT * FROM users ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY role, name`, values);
-  res.json({ users: rows.map(publicUser) });
+  const rows = await User.find(filter).sort({ role: 1, name: 1 }).lean();
+  res.json({ users: rows.map(r => publicUser(toPlainId(r))) });
 }));
 
 app.post('/api/users', requireAuth, requireRole('admin'), asyncHandler(async (req, res) => {
@@ -635,21 +747,30 @@ app.post('/api/users', requireAuth, requireRole('admin'), asyncHandler(async (re
 
   try {
     const timestamp = now();
-    const created = await one(`
-      INSERT INTO users (name, email, password_hash, role, department, phone, verticals, status, created_at, updated_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9)
-      RETURNING *
-    `, [name.trim(), email.toLowerCase().trim(), hashPassword(password), role, department || 'Planning', phone || '', verticals || '', timestamp, timestamp]);
-    res.status(201).json({ user: publicUser(created) });
+    const id = await nextId('users');
+    const created = await User.create({
+      _id: id,
+      name: name.trim(),
+      email: email.toLowerCase().trim(),
+      password_hash: hashPassword(password),
+      role,
+      department: department || 'Planning',
+      phone: phone || '',
+      verticals: verticals || '',
+      status: 'active',
+      created_at: timestamp,
+      updated_at: timestamp
+    });
+    res.status(201).json({ user: publicUser(created.toObject()) });
   } catch (error) {
-    if (error.code === '23505') return res.status(409).json({ message: 'Email already exists' });
+    if (error.code === 11000) return res.status(409).json({ message: 'Email already exists' });
     throw error;
   }
 }));
 
 app.patch('/api/users/:id', requireAuth, requireRole('admin'), asyncHandler(async (req, res) => {
   const id = Number(req.params.id);
-  const existing = await one('SELECT * FROM users WHERE id = $1', [id]);
+  const existing = await User.findById(id);
   if (!existing) return res.status(404).json({ message: 'User not found' });
   const next = {
     name: req.body.name ?? existing.name,
@@ -670,179 +791,155 @@ app.patch('/api/users/:id', requireAuth, requireRole('admin'), asyncHandler(asyn
     if (next.role !== 'admin') return res.status(400).json({ message: 'Admin role cannot be changed' });
   }
 
-  await query(
-    `UPDATE users SET name = $1, email = $2, role = $3, department = $4, phone = $5, verticals = $6, status = $7, updated_at = $8 WHERE id = $9`,
-    [next.name, next.email, next.role, next.department, next.phone, next.verticals, next.status, now(), id]
-  );
-  if (req.body.password) {
-    await query('UPDATE users SET password_hash = $1, updated_at = $2 WHERE id = $3', [hashPassword(req.body.password), now(), id]);
-  }
-  const user = await one('SELECT * FROM users WHERE id = $1', [id]);
-  res.json({ user: publicUser(user) });
+  existing.name = next.name;
+  existing.email = next.email;
+  existing.role = next.role;
+  existing.department = next.department;
+  existing.phone = next.phone;
+  existing.verticals = next.verticals;
+  existing.status = next.status;
+  existing.updated_at = now();
+  if (req.body.password) existing.password_hash = hashPassword(req.body.password);
+  await existing.save();
+  res.json({ user: publicUser(existing.toObject()) });
 }));
 
 app.delete('/api/users/:id', requireAuth, requireRole('admin'), asyncHandler(async (req, res) => {
   const id = Number(req.params.id);
   if (id === req.user.id) return res.status(400).json({ message: 'Admin cannot delete their own account' });
-  const existing = await one('SELECT * FROM users WHERE id = $1', [id]);
+  const existing = await User.findById(id).lean();
   if (!existing) return res.status(404).json({ message: 'User not found' });
   if (existing.role === 'admin') return res.status(400).json({ message: 'Admin accounts cannot be deleted' });
 
-  const storedFiles = await many(`
-    SELECT DISTINCT f.*
-    FROM task_files f
-    LEFT JOIN tasks t ON t.id = f.task_id
-    WHERE f.user_id = $1 OR t.assigned_by = $1 OR t.assigned_to = $1 OR t.planning_lead_id = $1
-  `, [id]);
+  const ownedTasks = await Task.find({
+    $or: [{ assigned_by: id }, { assigned_to: id }, { planning_lead_id: id }]
+  }).select('_id').lean();
+  const ownedTaskIds = ownedTasks.map(t => t._id);
 
-  await withTransaction(async (tx) => {
-    const linkedTasks = await tx.many('SELECT id FROM tasks WHERE assigned_by = $1 OR assigned_to = $1 OR planning_lead_id = $1', [id]);
-    for (const task of linkedTasks) {
-      await tx.query('DELETE FROM tasks WHERE id = $1', [task.id]);
+  const directFiles = await TaskFile.find({ user_id: id }).lean();
+  const ownedTaskFiles = ownedTaskIds.length
+    ? await TaskFile.find({ task_id: { $in: ownedTaskIds } }).lean()
+    : [];
+  const allFilesToRemove = [...directFiles, ...ownedTaskFiles];
+
+  await withTransaction(async (session) => {
+    for (const taskId of ownedTaskIds) {
+      await deleteTaskCascade(taskId, session);
     }
-    await tx.query('DELETE FROM task_planner_assignments WHERE planner_id = $1 OR assigned_by = $1', [id]);
-    await tx.query('DELETE FROM task_comments WHERE user_id = $1', [id]);
-    await tx.query('DELETE FROM task_files WHERE user_id = $1', [id]);
-    await tx.query('DELETE FROM task_status_history WHERE user_id = $1', [id]);
-    await tx.query('DELETE FROM task_declines WHERE planner_id = $1', [id]);
-    await tx.query('DELETE FROM users WHERE id = $1', [id]);
+    await TaskPlannerAssignment.deleteMany({ $or: [{ planner_id: id }, { assigned_by: id }] }).session(session);
+    await TaskComment.deleteMany({ user_id: id }).session(session);
+    await TaskFile.deleteMany({ user_id: id }).session(session);
+    await TaskStatusHistory.deleteMany({ user_id: id }).session(session);
+    await TaskDecline.deleteMany({ planner_id: id }).session(session);
+    await Notification.deleteMany({ user_id: id }).session(session);
+    await User.deleteOne({ _id: id }).session(session);
   });
 
-  await removeStoredFilesBestEffort(storedFiles);
+  await removeStoredFilesBestEffort(allFilesToRemove);
   res.json({ message: 'User deleted successfully' });
 }));
 
 app.get('/api/tasks', requireAuth, asyncHandler(async (req, res) => {
-  const values = [];
-  const where = [];
   const { status, priority, assigned_to, assigned_by, search, from, to, category, campaign_type, plan_format, view, scope } = req.query;
+  const filter = {};
+  const andConditions = [];
 
-  function addWhere(sqlPart, value) {
-    values.push(value);
-    where.push(sqlPart.replace('?', `$${values.length}`));
-  }
-
-  if (req.user.role === 'manager') addWhere('t.assigned_by = ?', req.user.id);
+  if (req.user.role === 'manager') filter.assigned_by = req.user.id;
   if (req.user.role === 'planning_lead') {
-    values.push(req.user.id);
-    const idx = values.length;
-    where.push(`(t.planning_lead_id = $${idx} OR t.assigned_to = $${idx} OR t.assigned_by = $${idx})`);
+    filter.$or = [
+      { planning_lead_id: req.user.id },
+      { assigned_to: req.user.id },
+      { assigned_by: req.user.id }
+    ];
   }
   // Planners can browse company-wide task summaries. Dashboard and other
   // personal views can explicitly request only their assigned records.
   if (req.user.role === 'planner' && scope === 'assigned') {
-    values.push(req.user.id);
-    where.push(`EXISTS (SELECT 1 FROM task_planner_assignments a WHERE a.task_id = t.id AND a.planner_id = $${values.length})`);
+    const ids = await TaskPlannerAssignment.find({ planner_id: req.user.id }).distinct('task_id');
+    andConditions.push({ _id: { $in: ids } });
   }
+
   if (view === 'completed') {
     if (req.user.role === 'planner') {
-      values.push(req.user.id);
-      where.push(`EXISTS (
-        SELECT 1
-        FROM task_planner_assignments a
-        WHERE a.task_id = t.id
-          AND a.planner_id = $${values.length}
-          AND a.status = 'Completed'
-      )`);
+      const ids = await TaskPlannerAssignment.find({ planner_id: req.user.id, status: 'Completed' }).distinct('task_id');
+      andConditions.push({ _id: { $in: ids } });
     } else {
-      where.push("t.status = 'Completed'");
+      filter.status = 'Completed';
     }
   }
   if (view === 'active') {
     if (req.user.role === 'planner') {
-      values.push(req.user.id);
-      where.push(`NOT EXISTS (
-        SELECT 1
-        FROM task_planner_assignments a
-        WHERE a.task_id = t.id
-          AND a.planner_id = $${values.length}
-          AND a.status = 'Completed'
-      )`);
+      const completedIds = await TaskPlannerAssignment.find({ planner_id: req.user.id, status: 'Completed' }).distinct('task_id');
+      andConditions.push({ _id: { $nin: completedIds } });
     } else {
-      where.push("t.status <> 'Completed'");
+      filter.status = { $ne: 'Completed' };
     }
   }
-  if (status && status !== 'all') addWhere('t.status = ?', status);
-  if (priority && priority !== 'all') addWhere('t.priority = ?', priority);
+  if (status && status !== 'all') filter.status = status;
+  if (priority && priority !== 'all') filter.priority = priority;
   if (assigned_to && assigned_to !== 'all') {
-    values.push(Number(assigned_to));
-    where.push(`EXISTS (SELECT 1 FROM task_planner_assignments a WHERE a.task_id = t.id AND a.planner_id = $${values.length})`);
+    const ids = await TaskPlannerAssignment.find({ planner_id: Number(assigned_to) }).distinct('task_id');
+    andConditions.push({ _id: { $in: ids } });
   }
-  if (assigned_by && assigned_by !== 'all') addWhere('t.assigned_by = ?', Number(assigned_by));
-  if (category && category !== 'all') addWhere('t.category = ?', category);
-  if (campaign_type && campaign_type !== 'all') addWhere('t.campaign_type = ?', campaign_type);
-  if (plan_format && plan_format !== 'all') addWhere('t.plan_format = ?', plan_format);
-  if (from) addWhere(`${deadlineDateExpression('t')} >= CAST(? AS DATE)`, from);
-  if (to) addWhere(`${deadlineDateExpression('t')} <= CAST(? AS DATE)`, to);
+  if (assigned_by && assigned_by !== 'all') filter.assigned_by = Number(assigned_by);
+  if (category && category !== 'all') filter.category = category;
+  if (campaign_type && campaign_type !== 'all') filter.campaign_type = campaign_type;
+  if (plan_format && plan_format !== 'all') filter.plan_format = plan_format;
+
+  const exprConditions = [];
+  if (from) exprConditions.push({ $gte: [deadlineExpr(), from] });
+  if (to) exprConditions.push({ $lte: [deadlineExpr(), to] });
+  if (exprConditions.length) {
+    andConditions.push({ $expr: exprConditions.length === 1 ? exprConditions[0] : { $and: exprConditions } });
+  }
+
   if (search) {
-    const s = `%${search}%`;
     const fields = [
-      't.task_code', 't.title', 't.client_name', 't.brand_name', 't.direct_client_or_agency',
-      't.agency_name', 't.campaign_type', 't.category', 't.plan_format', 't.target_areas',
-      't.target_audience_profile', 't.site_preferences', 't.additional_specifications'
+      'task_code', 'title', 'client_name', 'brand_name', 'direct_client_or_agency',
+      'agency_name', 'campaign_type', 'category', 'plan_format', 'target_areas',
+      'target_audience_profile', 'site_preferences', 'additional_specifications'
     ];
-    const clauses = [];
-    for (const field of fields) {
-      values.push(s);
-      clauses.push(`${field} ILIKE $${values.length}`);
+    andConditions.push({ $or: fields.map(f => ({ [f]: { $regex: escapeRegex(search), $options: 'i' } })) });
+  }
+
+  if (andConditions.length) filter.$and = andConditions;
+
+  const taskDocs = await Task.find(filter);
+  const taskIds = taskDocs.map(t => t._id);
+  const assignmentsByTask = await fetchAssignmentsForTasks(taskIds);
+  let tasks = await attachTaskDetailsBatch(taskDocs, assignmentsByTask);
+
+  if (view === 'completed') {
+    if (req.user.role === 'planner') {
+      tasks.sort((a, b) => {
+        const aOwn = (assignmentsByTask.get(Number(a.id)) || []).find(x => Number(x.planner_id) === Number(req.user.id));
+        const bOwn = (assignmentsByTask.get(Number(b.id)) || []).find(x => Number(x.planner_id) === Number(req.user.id));
+        const aKey = aOwn?.completed_at || a.completed_at || a.updated_at || a.created_at || '';
+        const bKey = bOwn?.completed_at || b.completed_at || b.updated_at || b.created_at || '';
+        if (aKey !== bKey) return aKey < bKey ? 1 : -1;
+        return Number(b.id) - Number(a.id);
+      });
+    } else {
+      tasks.sort((a, b) => {
+        const aKey = a.completed_at || a.updated_at || a.created_at || '';
+        const bKey = b.completed_at || b.updated_at || b.created_at || '';
+        if (aKey !== bKey) return aKey < bKey ? 1 : -1;
+        return Number(b.id) - Number(a.id);
+      });
     }
-    where.push(`(${clauses.join(' OR ')})`);
-  }
-
-  let orderSql;
-  if (view === 'completed' && req.user.role === 'planner') {
-    values.push(req.user.id);
-    orderSql = `COALESCE((
-      SELECT a.completed_at
-      FROM task_planner_assignments a
-      WHERE a.task_id = t.id AND a.planner_id = $${values.length}
-      LIMIT 1
-    ), t.completed_at, t.updated_at, t.created_at) DESC, t.id DESC`;
-  } else if (view === 'completed') {
-    orderSql = 'COALESCE(t.completed_at, t.updated_at, t.created_at) DESC, t.id DESC';
   } else {
-    orderSql = `CASE t.priority WHEN 'Urgent' THEN 0 WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END,
-      ${deadlineDateExpression('t')} ASC NULLS LAST,
-      t.created_at DESC`;
+    tasks.sort((a, b) => {
+      const pr = priorityRank(a.priority) - priorityRank(b.priority);
+      if (pr !== 0) return pr;
+      const aDeadline = effectiveDeadline(a);
+      const bDeadline = effectiveDeadline(b);
+      if ((aDeadline === '') !== (bDeadline === '')) return aDeadline === '' ? 1 : -1;
+      if (aDeadline !== bDeadline) return aDeadline < bDeadline ? -1 : 1;
+      if (a.created_at !== b.created_at) return a.created_at < b.created_at ? 1 : -1;
+      return 0;
+    });
   }
 
-  const tasks = await many(`
-    SELECT t.*,
-      assigner.name AS assigned_by_name,
-      assigner.role AS assigned_by_role,
-      planner.name AS assigned_to_name,
-      planner.role AS assigned_to_role,
-      lead.name AS planning_lead_name,
-      ARRAY(
-        SELECT a.planner_id
-        FROM task_planner_assignments a
-        WHERE a.task_id = t.id
-        ORDER BY a.id
-      ) AS planner_ids,
-      COALESCE((
-        SELECT string_agg(u.name, ', ' ORDER BY a.id)
-        FROM task_planner_assignments a
-        JOIN users u ON u.id = a.planner_id
-        WHERE a.task_id = t.id
-      ), '') AS assigned_planner_names,
-      (SELECT COUNT(*)::int FROM task_planner_assignments a WHERE a.task_id = t.id) AS planner_count,
-      (SELECT COUNT(*)::int FROM task_planner_assignments a WHERE a.task_id = t.id AND a.status = 'Completed') AS planner_completed_count,
-      COALESCE((
-        SELECT json_agg(json_build_object(
-          'planner_id', a.planner_id,
-          'status', a.status,
-          'assigned_locations', a.assigned_locations
-        ) ORDER BY a.id)
-        FROM task_planner_assignments a
-        WHERE a.task_id = t.id
-      ), '[]'::json) AS planner_assignments_summary
-    FROM tasks t
-    JOIN users assigner ON assigner.id = t.assigned_by
-    JOIN users planner ON planner.id = t.assigned_to
-    LEFT JOIN users lead ON lead.id = t.planning_lead_id
-    ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
-    ORDER BY ${orderSql}
-  `, values);
   const visibleTasks = req.user.role === 'planner'
     ? tasks.map(task => {
         const plannerIds = (task.planner_ids || []).map(Number);
@@ -896,7 +993,7 @@ app.post('/api/tasks', requireAuth, requireRole('admin', 'manager', 'planning_le
   }
 
   const leadId = Number(body.assigned_to);
-  const lead = await one("SELECT * FROM users WHERE id = $1 AND role = 'planning_lead' AND status = 'active'", [leadId]);
+  const lead = await User.findOne({ _id: leadId, role: 'planning_lead', status: 'active' }).lean();
   if (!lead) return res.status(400).json({ message: 'Assigned Planning Lead is not active or does not exist' });
 
   const isLeadCreator = req.user.role === 'planning_lead';
@@ -908,10 +1005,11 @@ app.post('/api/tasks', requireAuth, requireRole('admin', 'manager', 'planning_le
     if (requestedAssignments.length === 0) {
       return res.status(400).json({ message: 'Select at least one Planner when a Planning Lead creates a task' });
     }
-    selectedPlanners = await many(
-      "SELECT * FROM users WHERE id = ANY($1::int[]) AND role = 'planner' AND status = 'active'",
-      [requestedAssignments.map(item => item.planner_id)]
-    );
+    selectedPlanners = await User.find({
+      _id: { $in: requestedAssignments.map(item => item.planner_id) },
+      role: 'planner',
+      status: 'active'
+    }).lean();
     if (selectedPlanners.length !== requestedAssignments.length) {
       return res.status(400).json({ message: 'One or more selected Planners are inactive or do not exist' });
     }
@@ -932,92 +1030,89 @@ app.post('/api/tasks', requireAuth, requireRole('admin', 'manager', 'planning_le
   const additionalSpecifications = text(body.additional_specifications);
   const planFormat = text(body.plan_format);
   const initialStatus = isLeadCreator ? 'Pending Acceptance' : 'Pending Lead Assignment';
-  const initialAssigneeId = isLeadCreator ? requestedAssignments[0].planner_id : lead.id;
+  const initialAssigneeId = isLeadCreator ? requestedAssignments[0].planner_id : lead._id;
 
-  const created = await withTransaction(async (tx) => {
-    const taskCode = await generateTaskCode(tx);
-    const taskRow = await tx.one(`
-      INSERT INTO tasks (
-        task_code, title, client_name, brand_name, direct_client_or_agency, agency_name,
-        campaign_name, campaign_type, city, state, category, deliverable, description, priority,
-        status, assigned_by, assigned_to, planning_lead_id, start_date, due_date, campaign_start_date,
-        campaign_duration, campaign_budget, display_cost_range, target_areas,
-        target_audience_profile, site_preferences, ownership_type, location_type, size_preference,
-        additional_specifications, plan_format, submission_deadline, created_at, updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35)
-      RETURNING id
-    `, [
-      taskCode,
+  const created = await withTransaction(async (session) => {
+    const taskCode = await generateTaskCode(session);
+    const taskId = await nextId('tasks', session);
+    const [taskDoc] = await Task.create([{
+      _id: taskId,
+      task_code: taskCode,
       title,
-      clientName,
-      text(body.brand_name),
-      text(body.direct_client_or_agency),
-      text(body.agency_name),
-      text(body.campaign_name || body.brand_name),
-      text(body.campaign_type || ''),
-      text(body.city),
-      text(body.state || 'Tamil Nadu'),
-      text(body.category || 'Campaign Plan'),
-      buildDeliverable(body),
-      buildDescription(body),
-      text(body.priority || 'Medium') || 'Medium',
-      initialStatus,
-      req.user.id,
-      initialAssigneeId,
-      lead.id,
-      campaignStartDate,
-      submissionDeadline,
-      campaignStartDate,
-      text(body.campaign_duration),
-      text(body.campaign_budget),
-      text(body.display_cost_range),
-      text(body.target_areas),
-      text(body.target_audience_profile),
-      text(body.site_preferences),
-      text(body.ownership_type),
-      text(body.location_type),
-      text(body.size_preference),
-      additionalSpecifications,
-      planFormat,
-      submissionDeadline,
-      timestamp,
-      timestamp
-    ]);
+      client_name: clientName,
+      brand_name: text(body.brand_name),
+      direct_client_or_agency: text(body.direct_client_or_agency),
+      agency_name: text(body.agency_name),
+      campaign_name: text(body.campaign_name || body.brand_name),
+      campaign_type: text(body.campaign_type || ''),
+      city: text(body.city),
+      state: text(body.state || 'Tamil Nadu'),
+      category: text(body.category || 'Campaign Plan'),
+      deliverable: buildDeliverable(body),
+      description: buildDescription(body),
+      priority: text(body.priority || 'Medium') || 'Medium',
+      status: initialStatus,
+      assigned_by: req.user.id,
+      assigned_to: initialAssigneeId,
+      planning_lead_id: lead._id,
+      start_date: campaignStartDate,
+      due_date: submissionDeadline,
+      campaign_start_date: campaignStartDate,
+      campaign_duration: text(body.campaign_duration),
+      campaign_budget: text(body.campaign_budget),
+      display_cost_range: text(body.display_cost_range),
+      target_areas: text(body.target_areas),
+      target_audience_profile: text(body.target_audience_profile),
+      site_preferences: text(body.site_preferences),
+      ownership_type: text(body.ownership_type),
+      location_type: text(body.location_type),
+      size_preference: text(body.size_preference),
+      additional_specifications: additionalSpecifications,
+      plan_format: planFormat,
+      submission_deadline: submissionDeadline,
+      created_at: timestamp,
+      updated_at: timestamp
+    }], { session });
 
     if (isLeadCreator) {
       for (const assignment of requestedAssignments) {
-        await tx.query(`
-          INSERT INTO task_planner_assignments (
-            task_id, planner_id, assigned_by, assigned_locations, status, created_at, updated_at
-          ) VALUES ($1, $2, $3, $4, 'Pending Acceptance', $5, $6)
-        `, [taskRow.id, assignment.planner_id, req.user.id, assignment.assigned_locations, timestamp, timestamp]);
+        const assignmentId = await nextId('task_planner_assignments', session);
+        await TaskPlannerAssignment.create([{
+          _id: assignmentId,
+          task_id: taskDoc._id,
+          planner_id: assignment.planner_id,
+          assigned_by: req.user.id,
+          assigned_locations: assignment.assigned_locations,
+          status: 'Pending Acceptance',
+          created_at: timestamp,
+          updated_at: timestamp
+        }], { session });
       }
     }
-    return taskRow;
+    return taskDoc;
   });
 
   if (isLeadCreator) {
-    const plannerById = new Map(selectedPlanners.map(item => [Number(item.id), item]));
+    const plannerById = new Map(selectedPlanners.map(item => [Number(item._id), item]));
     const assignmentSummary = requestedAssignments.map(item => {
       const plannerName = plannerById.get(Number(item.planner_id))?.name || `Planner #${item.planner_id}`;
       return item.assigned_locations ? `${plannerName}: ${item.assigned_locations}` : plannerName;
     });
     const remarks = `Planning Lead: ${lead.name}; Planners: ${assignmentSummary.join(' | ')}`;
-    await addHistory(created.id, req.user.id, 'Task created and assigned to multiple Planners', null, 'Pending Acceptance', remarks);
-    await addComment(created.id, req.user.id, `Task request created with Planning Lead ${lead.name}. Planner allocation: ${assignmentSummary.join(' | ')}.`);
+    await addHistory(created._id, req.user.id, 'Task created and assigned to multiple Planners', null, 'Pending Acceptance', remarks);
+    await addComment(created._id, req.user.id, `Task request created with Planning Lead ${lead.name}. Planner allocation: ${assignmentSummary.join(' | ')}.`);
     await notifyUsers(
-      [lead.id],
-      created.id,
+      [lead._id],
+      created._id,
       'New task assigned to Planning Lead',
       `${req.user.name} selected you as Planning Lead for ${taskDisplayName({ brand_name: text(body.brand_name), title })}.`,
       'task_assigned_to_lead',
       req.user.id
     );
     for (const assignment of requestedAssignments) {
-      const planner = plannerById.get(Number(assignment.planner_id));
       await notifyUsers(
         [assignment.planner_id],
-        created.id,
+        created._id,
         'New task assigned to Planner',
         `${req.user.name} assigned ${taskDisplayName({ brand_name: text(body.brand_name), title })} to you for acceptance.${assignment.assigned_locations ? ` Your locations: ${assignment.assigned_locations}` : ''}`,
         'task_assigned_to_planner',
@@ -1025,11 +1120,11 @@ app.post('/api/tasks', requireAuth, requireRole('admin', 'manager', 'planning_le
       );
     }
   } else {
-    await addHistory(created.id, req.user.id, 'Task assigned to Planning Lead', null, 'Pending Lead Assignment', `Assigned to Planning Lead ${lead.name}`);
-    await addComment(created.id, req.user.id, `Task request created and assigned to Planning Lead ${lead.name}.`);
+    await addHistory(created._id, req.user.id, 'Task assigned to Planning Lead', null, 'Pending Lead Assignment', `Assigned to Planning Lead ${lead.name}`);
+    await addComment(created._id, req.user.id, `Task request created and assigned to Planning Lead ${lead.name}.`);
     await notifyUsers(
-      [lead.id],
-      created.id,
+      [lead._id],
+      created._id,
       'New task assigned to Planning Lead',
       `${req.user.name} assigned ${taskDisplayName({ brand_name: text(body.brand_name), title })} to you.`,
       'task_assigned_to_lead',
@@ -1037,33 +1132,29 @@ app.post('/api/tasks', requireAuth, requireRole('admin', 'manager', 'planning_le
     );
   }
 
-  res.status(201).json({ task: await fetchTask(created.id) });
+  res.status(201).json({ task: await fetchTask(created._id) });
 }));
 
 app.get('/api/tasks/:id', requireAuth, asyncHandler(async (req, res) => {
   const task = await fetchTask(Number(req.params.id));
   if (!canViewTask(req.user, task)) return res.status(404).json({ message: 'Task not found' });
-  const comments = await many(`
-    SELECT c.*, u.name, u.role FROM task_comments c
-    JOIN users u ON u.id = c.user_id
-    WHERE c.task_id = $1 ORDER BY c.created_at ASC
-  `, [task.id]);
-  const fileRows = await many(`
-    SELECT f.*, u.name FROM task_files f
-    JOIN users u ON u.id = f.user_id
-    WHERE f.task_id = $1 ORDER BY f.created_at DESC
-  `, [task.id]);
+  const comments = await joinUserFields(
+    await TaskComment.find({ task_id: task.id }).sort({ created_at: 1 }).lean(),
+    'user_id', ['name', 'role']
+  );
+  const fileRows = await joinUserFields(
+    await TaskFile.find({ task_id: task.id }).sort({ created_at: -1 }).lean(),
+    'user_id', ['name']
+  );
   const files = await Promise.all(fileRows.map(attachmentResponse));
-  const history = await many(`
-    SELECT h.*, u.name FROM task_status_history h
-    JOIN users u ON u.id = h.user_id
-    WHERE h.task_id = $1 ORDER BY h.created_at DESC
-  `, [task.id]);
-  const declines = await many(`
-    SELECT d.*, u.name FROM task_declines d
-    JOIN users u ON u.id = d.planner_id
-    WHERE d.task_id = $1 ORDER BY d.created_at DESC
-  `, [task.id]);
+  const history = await joinUserFields(
+    await TaskStatusHistory.find({ task_id: task.id }).sort({ created_at: -1 }).lean(),
+    'user_id', ['name']
+  );
+  const declines = await joinUserFields(
+    await TaskDecline.find({ task_id: task.id }).sort({ created_at: -1 }).lean(),
+    'planner_id', ['name']
+  );
   const plannerAssignments = await fetchPlannerAssignments(task.id);
   const myAssignment = req.user.role === 'planner'
     ? plannerAssignments.find(item => Number(item.planner_id) === Number(req.user.id)) || null
@@ -1102,22 +1193,29 @@ app.post('/api/tasks/:id/files', requireAuth, upload.fields([
   const storedFiles = [];
   try {
     for (const file of uploadedFiles) {
-      const objectPath = await uploadSupabaseFile(task.id, file);
-      storedFiles.push({ file, objectPath });
+      const gridfsId = await uploadGridFsFile(file);
+      storedFiles.push({ file, gridfsId });
     }
 
-    await withTransaction(async (tx) => {
-      for (const { file, objectPath } of storedFiles) {
-        await tx.query(`
-          INSERT INTO task_files (
-            task_id, user_id, file_name, file_path, file_type, file_size, storage_provider, created_at
-          )
-          VALUES ($1, $2, $3, $4, $5, $6, 'supabase', $7)
-        `, [task.id, req.user.id, file.originalname, objectPath, file.mimetype, file.size, now()]);
+    await withTransaction(async (session) => {
+      for (const { file, gridfsId } of storedFiles) {
+        const id = await nextId('task_files', session);
+        await TaskFile.create([{
+          _id: id,
+          task_id: task.id,
+          user_id: req.user.id,
+          file_name: file.originalname,
+          file_path: String(gridfsId),
+          file_type: file.mimetype,
+          file_size: file.size,
+          storage_provider: 'gridfs',
+          gridfs_id: gridfsId,
+          created_at: now()
+        }], { session });
       }
     });
   } catch (error) {
-    await removeSupabaseObjects(storedFiles.map(item => item.objectPath), false);
+    await Promise.all(storedFiles.map(item => removeGridFsFile(item.gridfsId, false)));
     throw error;
   } finally {
     await Promise.all(uploadedFiles.map(file => removeLocalUpload(file.filename)));
@@ -1144,14 +1242,11 @@ app.delete('/api/tasks/:taskId/files/:fileId', requireAuth, asyncHandler(async (
   const task = await fetchTask(Number(req.params.taskId));
   if (!canViewTask(req.user, task)) return res.status(404).json({ message: 'Task not found' });
 
-  const file = await one(`
-    SELECT * FROM task_files
-    WHERE id = $1 AND task_id = $2
-  `, [Number(req.params.fileId), task.id]);
+  const file = await TaskFile.findOne({ _id: Number(req.params.fileId), task_id: task.id }).lean();
   if (!file) return res.status(404).json({ message: 'File not found' });
 
   await removeStoredFile(file);
-  await query('DELETE FROM task_files WHERE id = $1', [file.id]);
+  await TaskFile.deleteOne({ _id: file._id });
   await addHistory(task.id, req.user.id, 'File deleted', task.status, task.status, file.file_name);
   await notifyUsers(
     taskParticipantIds(task),
@@ -1170,23 +1265,21 @@ app.post('/api/tasks/:id/accept', requireAuth, requireRole('planner'), asyncHand
   if (['Completed', 'Cancelled'].includes(task.status)) {
     return res.status(400).json({ message: 'This task is already closed' });
   }
-  const assignment = await one(
-    'SELECT * FROM task_planner_assignments WHERE task_id = $1 AND planner_id = $2',
-    [task.id, req.user.id]
-  );
+  const assignment = await TaskPlannerAssignment.findOne({ task_id: task.id, planner_id: req.user.id }).lean();
   if (!assignment) return res.status(404).json({ message: 'Planner assignment not found' });
   if (assignment.status !== 'Pending Acceptance') {
     return res.status(400).json({ message: 'This planner assignment cannot be accepted now' });
   }
 
-  const timestamp = now();
-  await query(`
-    UPDATE task_planner_assignments
-    SET status = 'Accepted', accepted_at = $1, declined_at = NULL, updated_at = $2
-    WHERE id = $3
-  `, [timestamp, timestamp, assignment.id]);
-  const synced = await syncTaskFromPlannerAssignments(task.id);
   const remarks = req.body.remarks || 'Planner accepted their assigned portion.';
+  const synced = await withTransaction(async (session) => {
+    const timestamp = now();
+    await TaskPlannerAssignment.updateOne(
+      { _id: assignment._id },
+      { $set: { status: 'Accepted', accepted_at: timestamp, declined_at: null, updated_at: timestamp } }
+    ).session(session);
+    return syncTaskFromPlannerAssignments(task.id, session);
+  });
   await addHistory(task.id, req.user.id, 'Planner assignment accepted', task.status, synced.newStatus, remarks);
   await addComment(task.id, req.user.id, `${remarks}${assignment.assigned_locations ? ` Locations: ${assignment.assigned_locations}` : ''}`);
   const refreshed = await fetchTask(task.id);
@@ -1207,23 +1300,28 @@ app.post('/api/tasks/:id/decline', requireAuth, requireRole('planner'), asyncHan
   if (['Completed', 'Cancelled'].includes(task.status)) {
     return res.status(400).json({ message: 'This task is already closed' });
   }
-  const assignment = await one(
-    'SELECT * FROM task_planner_assignments WHERE task_id = $1 AND planner_id = $2',
-    [task.id, req.user.id]
-  );
+  const assignment = await TaskPlannerAssignment.findOne({ task_id: task.id, planner_id: req.user.id }).lean();
   if (!assignment) return res.status(404).json({ message: 'Planner assignment not found' });
   if (assignment.status !== 'Pending Acceptance') return res.status(400).json({ message: 'Only pending planner assignments can be declined' });
   const reason = String(req.body.reason || '').trim();
   if (!reason) return res.status(400).json({ message: 'Decline reason is required' });
 
-  const timestamp = now();
-  await query(`
-    UPDATE task_planner_assignments
-    SET status = 'Declined', declined_at = $1, updated_at = $2
-    WHERE id = $3
-  `, [timestamp, timestamp, assignment.id]);
-  await query('INSERT INTO task_declines (task_id, planner_id, reason, created_at) VALUES ($1, $2, $3, $4)', [task.id, req.user.id, reason, timestamp]);
-  const synced = await syncTaskFromPlannerAssignments(task.id);
+  const synced = await withTransaction(async (session) => {
+    const timestamp = now();
+    await TaskPlannerAssignment.updateOne(
+      { _id: assignment._id },
+      { $set: { status: 'Declined', declined_at: timestamp, updated_at: timestamp } }
+    ).session(session);
+    const declineId = await nextId('task_declines', session);
+    await TaskDecline.create([{
+      _id: declineId,
+      task_id: task.id,
+      planner_id: req.user.id,
+      reason,
+      created_at: timestamp
+    }], { session });
+    return syncTaskFromPlannerAssignments(task.id, session);
+  });
   await addHistory(task.id, req.user.id, 'Planner assignment declined', task.status, synced.newStatus, reason);
   await addComment(task.id, req.user.id, `Declined assigned portion: ${reason}`);
   const refreshed = await fetchTask(task.id);
@@ -1255,22 +1353,18 @@ app.patch('/api/tasks/:id/status', requireAuth, asyncHandler(async (req, res) =>
     if (!plannerAllowed.includes(nextStatus)) {
       return res.status(403).json({ message: 'Planner can only update their portion to In Progress, Waiting for Details or Completed' });
     }
-    const assignment = await one(
-      'SELECT * FROM task_planner_assignments WHERE task_id = $1 AND planner_id = $2',
-      [task.id, req.user.id]
-    );
+    const assignment = await TaskPlannerAssignment.findOne({ task_id: task.id, planner_id: req.user.id }).lean();
     if (!assignment) return res.status(403).json({ message: 'This task is not assigned to you' });
     if (assignment.status === 'Pending Acceptance') return res.status(400).json({ message: 'Accept your assignment before updating its status' });
 
-    const timestamp = now();
-    await query(`
-      UPDATE task_planner_assignments
-      SET status = $1,
-          completed_at = CASE WHEN $1 = 'Completed' THEN $2 ELSE NULL END,
-          updated_at = $2
-      WHERE id = $3
-    `, [nextStatus, timestamp, assignment.id]);
-    const synced = await syncTaskFromPlannerAssignments(task.id);
+    const synced = await withTransaction(async (session) => {
+      const timestamp = now();
+      await TaskPlannerAssignment.updateOne(
+        { _id: assignment._id },
+        { $set: { status: nextStatus, completed_at: nextStatus === 'Completed' ? timestamp : null, updated_at: timestamp } }
+      ).session(session);
+      return syncTaskFromPlannerAssignments(task.id, session);
+    });
     const locationNote = assignment.assigned_locations ? ` Locations: ${assignment.assigned_locations}.` : '';
     await addHistory(task.id, req.user.id, 'Planner portion status updated', task.status, synced.newStatus, `${nextStatus}.${locationNote}${remarks ? ` ${remarks}` : ''}`);
     if (remarks) await addComment(task.id, req.user.id, remarks);
@@ -1298,26 +1392,20 @@ app.patch('/api/tasks/:id/status', requireAuth, asyncHandler(async (req, res) =>
   if (nextStatus === 'Completed' && assignments.length > 0) {
     // Admin, BD and Lead retain their existing ability to complete a task.
     // Completing the parent task also closes every planner portion so progress stays consistent.
-    await query(`
-      UPDATE task_planner_assignments
-      SET status = 'Completed', completed_at = $1, updated_at = $2
-      WHERE task_id = $3
-    `, [timestamp, timestamp, task.id]);
-    await syncTaskFromPlannerAssignments(task.id);
+    await withTransaction(async (session) => {
+      await TaskPlannerAssignment.updateMany(
+        { task_id: task.id },
+        { $set: { status: 'Completed', completed_at: timestamp, updated_at: timestamp } }
+      ).session(session);
+      await syncTaskFromPlannerAssignments(task.id, session);
+    });
   } else {
-    const updates = ['status = $1', 'updated_at = $2'];
-    const values = [nextStatus, timestamp];
-    if (nextStatus === 'Submitted for Review') {
-      values.push(timestamp);
-      updates.push(`submitted_at = $${values.length}`);
-    }
-    if (nextStatus === 'Completed') {
-      values.push(timestamp);
-      updates.push(`completed_at = $${values.length}`);
-    }
-    if (nextStatus === 'Rework Required') updates.push('rework_count = COALESCE(rework_count, 0) + 1');
-    values.push(task.id);
-    await query(`UPDATE tasks SET ${updates.join(', ')} WHERE id = $${values.length}`, values);
+    const update = { status: nextStatus, updated_at: timestamp };
+    if (nextStatus === 'Submitted for Review') update.submitted_at = timestamp;
+    if (nextStatus === 'Completed') update.completed_at = timestamp;
+    const updateOps = { $set: update };
+    if (nextStatus === 'Rework Required') updateOps.$inc = { rework_count: 1 };
+    await Task.updateOne({ _id: task.id }, updateOps);
   }
 
   await addHistory(task.id, req.user.id, 'Status updated', task.status, nextStatus, remarks);
@@ -1350,10 +1438,7 @@ app.patch('/api/tasks/:id/conversion-status', requireAuth, requireRole('admin', 
   if (previousStatus === nextStatus) return res.json({ task });
 
   const timestamp = now();
-  await query(
-    'UPDATE tasks SET conversion_status = $1, updated_at = $2 WHERE id = $3',
-    [nextStatus, timestamp, task.id]
-  );
+  await Task.updateOne({ _id: task.id }, { $set: { conversion_status: nextStatus, updated_at: timestamp } });
   await addHistory(
     task.id,
     req.user.id,
@@ -1381,7 +1466,7 @@ app.patch('/api/tasks/:id/reassign-lead', requireAuth, requireRole('admin', 'man
   if (task.status === 'Completed') return res.status(400).json({ message: 'Completed tasks cannot be reassigned' });
 
   const newLeadId = Number(req.body.planning_lead_id);
-  const newLead = await one("SELECT * FROM users WHERE id = $1 AND role = 'planning_lead' AND status = 'active'", [newLeadId]);
+  const newLead = await User.findOne({ _id: newLeadId, role: 'planning_lead', status: 'active' }).lean();
   if (!newLead) return res.status(400).json({ message: 'Selected Planning Lead is not active or does not exist' });
   if (Number(task.planning_lead_id) === newLeadId) return res.status(400).json({ message: 'This Planning Lead is already assigned to the task' });
 
@@ -1392,19 +1477,19 @@ app.patch('/api/tasks/:id/reassign-lead', requireAuth, requireRole('admin', 'man
     ? `Planning Lead changed from ${previousLeadName} to ${newLead.name}. Planner assignments cleared: ${previousPlannerNames.join(', ')}.`
     : `Planning Lead changed from ${previousLeadName} to ${newLead.name}.`;
 
-  await withTransaction(async (tx) => {
-    await tx.query('DELETE FROM task_planner_assignments WHERE task_id = $1', [task.id]);
-    await tx.query(`
-      UPDATE tasks
-      SET planning_lead_id = $1,
-          assigned_to = $1,
-          status = 'Pending Lead Assignment',
-          declined_at = NULL,
-          accepted_at = NULL,
-          completed_at = NULL,
-          updated_at = $2
-      WHERE id = $3
-    `, [newLeadId, now(), task.id]);
+  await withTransaction(async (session) => {
+    await TaskPlannerAssignment.deleteMany({ task_id: task.id }).session(session);
+    await Task.updateOne({ _id: task.id }, {
+      $set: {
+        planning_lead_id: newLeadId,
+        assigned_to: newLeadId,
+        status: 'Pending Lead Assignment',
+        declined_at: null,
+        accepted_at: null,
+        completed_at: null,
+        updated_at: now()
+      }
+    }).session(session);
   });
   await addHistory(task.id, req.user.id, 'Planning Lead reassigned', task.status, 'Pending Lead Assignment', message);
   await addComment(task.id, req.user.id, message);
@@ -1430,10 +1515,7 @@ app.put('/api/tasks/:id/planner-assignments', requireAuth, requireRole('admin', 
   }
 
   const plannerIds = requestedAssignments.map(item => item.planner_id);
-  const selectedPlanners = await many(
-    "SELECT * FROM users WHERE id = ANY($1::int[]) AND role = 'planner' AND status = 'active'",
-    [plannerIds]
-  );
+  const selectedPlanners = await User.find({ _id: { $in: plannerIds }, role: 'planner', status: 'active' }).lean();
   if (selectedPlanners.length !== plannerIds.length) {
     return res.status(400).json({ message: 'One or more selected Planners are inactive or do not exist' });
   }
@@ -1445,37 +1527,44 @@ app.put('/api/tasks/:id/planner-assignments', requireAuth, requireRole('admin', 
   const removedAssignments = previousAssignments.filter(item => !nextIds.has(Number(item.planner_id)));
   const timestamp = now();
 
-  await withTransaction(async (tx) => {
+  await withTransaction(async (session) => {
     if (removedAssignments.length) {
-      await tx.query(
-        'DELETE FROM task_planner_assignments WHERE task_id = $1 AND planner_id = ANY($2::int[])',
-        [task.id, removedAssignments.map(item => item.planner_id)]
-      );
+      await TaskPlannerAssignment.deleteMany({
+        task_id: task.id,
+        planner_id: { $in: removedAssignments.map(item => item.planner_id) }
+      }).session(session);
     }
     for (const assignment of requestedAssignments) {
-      await tx.query(`
-        INSERT INTO task_planner_assignments (
-          task_id, planner_id, assigned_by, assigned_locations, status, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, 'Pending Acceptance', $5, $6)
-        ON CONFLICT (task_id, planner_id) DO UPDATE SET
-          assigned_locations = EXCLUDED.assigned_locations,
-          assigned_by = EXCLUDED.assigned_by,
-          status = CASE
-            WHEN task_planner_assignments.status = 'Declined' THEN 'Pending Acceptance'
-            ELSE task_planner_assignments.status
-          END,
-          declined_at = CASE
-            WHEN task_planner_assignments.status = 'Declined' THEN NULL
-            ELSE task_planner_assignments.declined_at
-          END,
-          updated_at = EXCLUDED.updated_at
-      `, [task.id, assignment.planner_id, req.user.id, assignment.assigned_locations, timestamp, timestamp]);
+      const existing = await TaskPlannerAssignment.findOne({ task_id: task.id, planner_id: assignment.planner_id }).session(session);
+      if (existing) {
+        const resetFromDecline = existing.status === 'Declined';
+        existing.assigned_locations = assignment.assigned_locations;
+        existing.assigned_by = req.user.id;
+        existing.updated_at = timestamp;
+        if (resetFromDecline) {
+          existing.status = 'Pending Acceptance';
+          existing.declined_at = null;
+        }
+        await existing.save({ session });
+      } else {
+        const id = await nextId('task_planner_assignments', session);
+        await TaskPlannerAssignment.create([{
+          _id: id,
+          task_id: task.id,
+          planner_id: assignment.planner_id,
+          assigned_by: req.user.id,
+          assigned_locations: assignment.assigned_locations,
+          status: 'Pending Acceptance',
+          created_at: timestamp,
+          updated_at: timestamp
+        }], { session });
+      }
     }
-    await tx.query('UPDATE tasks SET assigned_to = $1, updated_at = $2 WHERE id = $3', [requestedAssignments[0].planner_id, timestamp, task.id]);
-    await syncTaskFromPlannerAssignments(task.id, tx);
+    await Task.updateOne({ _id: task.id }, { $set: { assigned_to: requestedAssignments[0].planner_id, updated_at: timestamp } }).session(session);
+    await syncTaskFromPlannerAssignments(task.id, session);
   });
 
-  const plannerById = new Map(selectedPlanners.map(item => [Number(item.id), item]));
+  const plannerById = new Map(selectedPlanners.map(item => [Number(item._id), item]));
   const summaryParts = requestedAssignments.map(item => {
     const name = plannerById.get(Number(item.planner_id))?.name || `Planner #${item.planner_id}`;
     return item.assigned_locations ? `${name}: ${item.assigned_locations}` : name;
@@ -1485,7 +1574,6 @@ app.put('/api/tasks/:id/planner-assignments', requireAuth, requireRole('admin', 
   await addComment(task.id, req.user.id, `Planner allocation updated: ${summaryParts.join(' | ')}.`);
 
   for (const assignment of requestedAssignments) {
-    const planner = plannerById.get(Number(assignment.planner_id));
     const isNew = addedIds.map(Number).includes(Number(assignment.planner_id));
     await notifyUsers(
       [assignment.planner_id],
@@ -1516,7 +1604,7 @@ async function replaceWithSinglePlanner(req, res) {
   if (task.status === 'Completed') return res.status(400).json({ message: 'Completed tasks cannot be reassigned' });
 
   const newPlannerId = Number(req.body.assigned_to);
-  const planner = await one("SELECT * FROM users WHERE id = $1 AND role = 'planner' AND status = 'active'", [newPlannerId]);
+  const planner = await User.findOne({ _id: newPlannerId, role: 'planner', status: 'active' }).lean();
   if (!planner) return res.status(400).json({ message: 'Selected planner is not active or does not exist' });
 
   const previousAssignments = await fetchPlannerAssignments(task.id);
@@ -1525,19 +1613,29 @@ async function replaceWithSinglePlanner(req, res) {
   }
 
   const timestamp = now();
-  await withTransaction(async (tx) => {
-    await tx.query('DELETE FROM task_planner_assignments WHERE task_id = $1', [task.id]);
-    await tx.query(`
-      INSERT INTO task_planner_assignments (
-        task_id, planner_id, assigned_by, assigned_locations, status, created_at, updated_at
-      ) VALUES ($1, $2, $3, $4, 'Pending Acceptance', $5, $6)
-    `, [task.id, newPlannerId, req.user.id, text(req.body.assigned_locations || task.target_areas), timestamp, timestamp]);
-    await tx.query(`
-      UPDATE tasks
-      SET assigned_to = $1, status = 'Pending Acceptance', declined_at = NULL,
-          accepted_at = NULL, completed_at = NULL, updated_at = $2
-      WHERE id = $3
-    `, [newPlannerId, timestamp, task.id]);
+  await withTransaction(async (session) => {
+    await TaskPlannerAssignment.deleteMany({ task_id: task.id }).session(session);
+    const id = await nextId('task_planner_assignments', session);
+    await TaskPlannerAssignment.create([{
+      _id: id,
+      task_id: task.id,
+      planner_id: newPlannerId,
+      assigned_by: req.user.id,
+      assigned_locations: text(req.body.assigned_locations || task.target_areas),
+      status: 'Pending Acceptance',
+      created_at: timestamp,
+      updated_at: timestamp
+    }], { session });
+    await Task.updateOne({ _id: task.id }, {
+      $set: {
+        assigned_to: newPlannerId,
+        status: 'Pending Acceptance',
+        declined_at: null,
+        accepted_at: null,
+        completed_at: null,
+        updated_at: timestamp
+      }
+    }).session(session);
   });
 
   const previousNames = previousAssignments.map(item => item.planner_name);
@@ -1564,88 +1662,110 @@ app.patch('/api/tasks/:id/reassign-planner', requireAuth, requireRole('admin', '
 app.patch('/api/tasks/:id/reassign', requireAuth, requireRole('admin', 'manager', 'planning_lead'), asyncHandler(replaceWithSinglePlanner));
 
 app.delete('/api/tasks/:id', requireAuth, requireRole('admin'), asyncHandler(async (req, res) => {
-  const task = await fetchTask(Number(req.params.id));
+  const taskId = Number(req.params.id);
+  const task = await Task.findById(taskId).lean();
   if (!task) return res.status(404).json({ message: 'Task not found' });
-  const files = await many('SELECT * FROM task_files WHERE task_id = $1', [task.id]);
-  await query('DELETE FROM tasks WHERE id = $1', [task.id]);
+  const files = await TaskFile.find({ task_id: taskId }).lean();
+  await withTransaction(async (session) => {
+    await deleteTaskCascade(taskId, session);
+  });
   await removeStoredFilesBestEffort(files);
   res.json({ message: 'Task deleted' });
 }));
 
 app.get('/api/reports/overview', requireAuth, asyncHandler(async (req, res) => {
   const user = req.user;
-  const values = [];
-  const where = [];
-  if (user.role === 'manager') {
-    values.push(user.id);
-    where.push(`assigned_by = $${values.length}`);
-  }
-  if (user.role === 'planning_lead') {
-    values.push(user.id);
-    const idx = values.length;
-    where.push(`(planning_lead_id = $${idx} OR assigned_to = $${idx} OR assigned_by = $${idx})`);
-  }
-  if (user.role === 'planner') {
-    values.push(user.id);
-    where.push(`EXISTS (SELECT 1 FROM task_planner_assignments a WHERE a.task_id = tasks.id AND a.planner_id = $${values.length})`);
-  }
-  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const statusCounts = await many(`SELECT status, COUNT(*)::int as count FROM tasks ${whereSql} GROUP BY status`, values);
-  const priorityCounts = await many(`SELECT priority, COUNT(*)::int as count FROM tasks ${whereSql} GROUP BY priority`, values);
-  const total = (await one(`SELECT COUNT(*)::int as count FROM tasks ${whereSql}`, values))?.count || 0;
-  const overdue = (await one(`SELECT COUNT(*)::int as count FROM tasks ${whereSql ? `${whereSql} AND` : 'WHERE'} status NOT IN ('Completed', 'Cancelled', 'Declined') AND ${deadlineDateExpression()} < CURRENT_DATE`, values))?.count || 0;
-  const dueToday = (await one(`SELECT COUNT(*)::int as count FROM tasks ${whereSql ? `${whereSql} AND` : 'WHERE'} status NOT IN ('Completed', 'Cancelled', 'Declined') AND ${deadlineDateExpression()} = CURRENT_DATE`, values))?.count || 0;
-  const completed = (await one(`SELECT COUNT(*)::int as count FROM tasks ${whereSql ? `${whereSql} AND` : 'WHERE'} status = 'Completed'`, values))?.count || 0;
-  const conversionCounts = await many(`
-    SELECT COALESCE(conversion_status, 'Pending') AS conversion_status, COUNT(*)::int AS count
-    FROM tasks
-    ${whereSql ? `${whereSql} AND` : 'WHERE'} status = 'Completed'
-    GROUP BY COALESCE(conversion_status, 'Pending')
-  `, values);
-  const conversionMap = Object.fromEntries(conversionCounts.map(row => [row.conversion_status, row.count]));
+  const filter = await buildVisibilityFilter(user);
+  const today = new Date().toISOString().slice(0, 10);
+
+  const [statusCountsRaw, priorityCountsRaw, total] = await Promise.all([
+    Task.aggregate([{ $match: filter }, { $group: { _id: '$status', count: { $sum: 1 } } }]),
+    Task.aggregate([{ $match: filter }, { $group: { _id: '$priority', count: { $sum: 1 } } }]),
+    Task.countDocuments(filter)
+  ]);
+  const statusCounts = statusCountsRaw.map(r => ({ status: r._id, count: r.count }));
+  const priorityCounts = priorityCountsRaw.map(r => ({ priority: r._id, count: r.count }));
+
+  const openFilter = { ...filter, status: { $nin: ['Completed', 'Cancelled', 'Declined'] } };
+  const [overdue, dueToday, completed, conversionCountsRaw] = await Promise.all([
+    Task.countDocuments({ ...openFilter, $expr: { $lt: [deadlineExpr(), today] } }),
+    Task.countDocuments({ ...openFilter, $expr: { $eq: [deadlineExpr(), today] } }),
+    Task.countDocuments({ ...filter, status: 'Completed' }),
+    Task.aggregate([
+      { $match: { ...filter, status: 'Completed' } },
+      { $group: { _id: { $ifNull: ['$conversion_status', 'Pending'] }, count: { $sum: 1 } } }
+    ])
+  ]);
+  const conversionMap = Object.fromEntries(conversionCountsRaw.map(row => [row._id, row.count]));
   const won = conversionMap.Won || 0;
   const loss = conversionMap.Loss || 0;
   const pendingConversion = conversionMap.Pending || 0;
   const conversionRate = completed > 0 ? Number(((won / completed) * 100).toFixed(1)) : 0;
 
-  const workloadParams = user.role === 'manager' ? [user.id] : (user.role === 'planning_lead' ? [user.id] : []);
-  const workloadScope = user.role === 'manager'
-    ? 'AND t.assigned_by = $1'
-    : (user.role === 'planning_lead' ? 'AND (t.planning_lead_id = $1 OR t.assigned_by = $1)' : '');
-  const workload = await many(`
-    SELECT u.id, u.name, u.verticals, COUNT(t.id)::int AS total,
-      COALESCE(SUM(CASE WHEN t.id IS NOT NULL AND a.status NOT IN ('Completed', 'Declined') THEN 1 ELSE 0 END), 0)::int AS active,
-      COALESCE(SUM(CASE WHEN t.id IS NOT NULL AND a.status = 'Pending Acceptance' THEN 1 ELSE 0 END), 0)::int AS pending,
-      COALESCE(SUM(CASE WHEN t.id IS NOT NULL AND a.status IN ('Waiting for Details') THEN 1 ELSE 0 END), 0)::int AS review,
-      COALESCE(SUM(CASE WHEN t.id IS NOT NULL AND a.status NOT IN ('Completed', 'Declined') AND ${deadlineDateExpression('t')} < CURRENT_DATE THEN 1 ELSE 0 END), 0)::int AS overdue,
-      COALESCE(SUM(CASE WHEN t.id IS NOT NULL AND a.status = 'Completed' THEN 1 ELSE 0 END), 0)::int AS completed
-    FROM users u
-    LEFT JOIN task_planner_assignments a ON a.planner_id = u.id
-    LEFT JOIN tasks t ON t.id = a.task_id ${workloadScope}
-    WHERE u.role = 'planner' AND u.status = 'active'
-    GROUP BY u.id, u.name, u.verticals
-    ORDER BY active DESC, overdue DESC, total DESC
-  `, workloadParams);
+  const plannerTaskFilter = {};
+  if (user.role === 'manager') plannerTaskFilter.assigned_by = user.id;
+  if (user.role === 'planning_lead') plannerTaskFilter.$or = [{ planning_lead_id: user.id }, { assigned_by: user.id }];
 
-  const workloadTaskWhere = user.role === 'manager'
-    ? 'WHERE t.assigned_by = $1 AND'
-    : user.role === 'planning_lead'
-      ? 'WHERE (t.planning_lead_id = $1 OR t.assigned_by = $1) AND'
-      : user.role === 'planner'
-        ? 'WHERE a.planner_id = $1 AND'
-        : 'WHERE';
-  const workloadTasks = await many(`
-    SELECT t.id, t.task_code, t.title, t.brand_name, a.status, t.priority, t.due_date, t.submission_deadline,
-      a.planner_id AS assigned_to, a.assigned_locations, u.name AS planner_name
-    FROM task_planner_assignments a
-    JOIN tasks t ON t.id = a.task_id
-    JOIN users u ON u.id = a.planner_id
-    ${workloadTaskWhere} a.status NOT IN ('Completed', 'Declined')
-    ORDER BY ${deadlineDateExpression('t')} ASC NULLS LAST,
-      CASE t.priority WHEN 'Urgent' THEN 0 WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END,
-      t.created_at DESC
-    LIMIT 18
-  `, values);
+  const activePlanners = await User.find({ role: 'planner', status: 'active' }).select('name verticals').lean();
+  const plannerIds = activePlanners.map(p => Number(p._id));
+  const relevantAssignments = plannerIds.length
+    ? await TaskPlannerAssignment.find({ planner_id: { $in: plannerIds } }).lean()
+    : [];
+  const relevantTaskIds = uniqueIds(relevantAssignments.map(a => a.task_id));
+  const relevantTasks = relevantTaskIds.length
+    ? await Task.find({ _id: { $in: relevantTaskIds }, ...plannerTaskFilter }).lean()
+    : [];
+  const relevantTaskMap = new Map(relevantTasks.map(t => [Number(t._id), t]));
+
+  const workload = activePlanners.map(planner => {
+    const withTasks = relevantAssignments
+      .filter(a => Number(a.planner_id) === Number(planner._id) && relevantTaskMap.has(Number(a.task_id)))
+      .map(a => ({ assignment: a, task: relevantTaskMap.get(Number(a.task_id)) }));
+    const overdueCount = withTasks.filter(x => {
+      if (['Completed', 'Declined'].includes(x.assignment.status)) return false;
+      const deadline = effectiveDeadline(x.task);
+      return deadline && deadline < today;
+    }).length;
+    return {
+      id: planner._id,
+      name: planner.name,
+      verticals: planner.verticals,
+      total: withTasks.length,
+      active: withTasks.filter(x => !['Completed', 'Declined'].includes(x.assignment.status)).length,
+      pending: withTasks.filter(x => x.assignment.status === 'Pending Acceptance').length,
+      review: withTasks.filter(x => x.assignment.status === 'Waiting for Details').length,
+      overdue: overdueCount,
+      completed: withTasks.filter(x => x.assignment.status === 'Completed').length
+    };
+  }).sort((a, b) => (b.active - a.active) || (b.overdue - a.overdue) || (b.total - a.total));
+
+  const plannerNameMap = new Map(activePlanners.map(p => [Number(p._id), p.name]));
+  const workloadTasks = relevantAssignments
+    .filter(a => !['Completed', 'Declined'].includes(a.status) && relevantTaskMap.has(Number(a.task_id)))
+    .map(a => {
+      const task = relevantTaskMap.get(Number(a.task_id));
+      return {
+        id: task._id,
+        task_code: task.task_code,
+        title: task.title,
+        brand_name: task.brand_name,
+        status: a.status,
+        priority: task.priority,
+        due_date: task.due_date,
+        submission_deadline: task.submission_deadline,
+        assigned_to: a.planner_id,
+        assigned_locations: a.assigned_locations,
+        planner_name: plannerNameMap.get(Number(a.planner_id)) || null
+      };
+    })
+    .sort((a, b) => {
+      const aDeadline = a.submission_deadline || a.due_date || '';
+      const bDeadline = b.submission_deadline || b.due_date || '';
+      if ((aDeadline === '') !== (bDeadline === '')) return aDeadline === '' ? 1 : -1;
+      if (aDeadline !== bDeadline) return aDeadline < bDeadline ? -1 : 1;
+      return priorityRank(a.priority) - priorityRank(b.priority);
+    })
+    .slice(0, 18);
 
   res.json({
     total,
@@ -1666,56 +1786,80 @@ app.get('/api/reports/overview', requireAuth, asyncHandler(async (req, res) => {
 }));
 
 app.get('/api/reports/export', requireAuth, asyncHandler(async (req, res) => {
-  const values = [];
-  const where = [];
-
-  if (req.user.role === 'manager') {
-    values.push(req.user.id);
-    where.push(`t.assigned_by = $${values.length}`);
-  }
+  let taskFilter = {};
+  if (req.user.role === 'manager') taskFilter = { assigned_by: req.user.id };
   if (req.user.role === 'planning_lead') {
-    values.push(req.user.id);
-    const idx = values.length;
-    where.push(`(t.planning_lead_id = $${idx} OR t.assigned_to = $${idx} OR t.assigned_by = $${idx})`);
+    taskFilter = { $or: [{ planning_lead_id: req.user.id }, { assigned_to: req.user.id }, { assigned_by: req.user.id }] };
   }
   if (req.user.role === 'planner') {
-    values.push(req.user.id);
-    where.push(`COALESCE(a.planner_id, t.assigned_to) = $${values.length}`);
+    const ids = await TaskPlannerAssignment.find({ planner_id: req.user.id }).distinct('task_id');
+    taskFilter = { $or: [{ _id: { $in: ids } }, { assigned_to: req.user.id }] };
   }
 
-  const reportRows = await many(`
-    SELECT
-      t.created_at AS request_received_at,
-      t.task_code,
-      CASE
-        WHEN LOWER(COALESCE(t.direct_client_or_agency, '')) = 'ad agency'
-          THEN COALESCE(NULLIF(t.agency_name, ''), NULLIF(t.brand_name, ''), NULLIF(t.client_name, ''), '')
-        ELSE COALESCE(NULLIF(t.brand_name, ''), NULLIF(t.client_name, ''), NULLIF(t.agency_name, ''), '')
-      END AS brand_or_agency_name,
-      COALESCE(t.direct_client_or_agency, '') AS customer_type,
-      COALESCE(t.plan_format, '') AS plan_required,
-      assigner.name AS assigned_by_name,
-      COALESCE(CASE WHEN planner.role = 'planner' THEN planner.name END, '') AS planner_name,
-      COALESCE(NULLIF(a.assigned_locations, ''), NULLIF(t.target_areas, ''), '') AS target_areas,
-      CASE
-        WHEN a.id IS NOT NULL THEN a.created_at
-        WHEN planner.role = 'planner' THEN t.created_at
-        ELSE NULL
-      END AS plan_assigned_at,
-      CASE
-        WHEN a.id IS NOT NULL THEN a.completed_at
-        WHEN planner.role = 'planner' AND t.status = 'Completed' THEN t.completed_at
-        ELSE NULL
-      END AS plan_completed_at,
-      COALESCE(a.status, t.status) AS assignment_status,
-      COALESCE(t.conversion_status, 'Pending') AS conversion_status
-    FROM tasks t
-    JOIN users assigner ON assigner.id = t.assigned_by
-    LEFT JOIN task_planner_assignments a ON a.task_id = t.id
-    LEFT JOIN users planner ON planner.id = COALESCE(a.planner_id, t.assigned_to)
-    ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
-    ORDER BY t.created_at DESC, t.id DESC, a.id ASC NULLS LAST
-  `, values);
+  const tasks = await Task.find(taskFilter).sort({ created_at: -1, _id: -1 }).lean();
+  const taskIds = tasks.map(t => Number(t._id));
+  const assignments = taskIds.length
+    ? await TaskPlannerAssignment.find({ task_id: { $in: taskIds } }).sort({ _id: 1 }).lean()
+    : [];
+  const userIds = uniqueIds([
+    ...tasks.map(t => t.assigned_by),
+    ...tasks.map(t => t.assigned_to),
+    ...assignments.map(a => a.planner_id)
+  ]);
+  const users = userIds.length ? await User.find({ _id: { $in: userIds } }).select('name role').lean() : [];
+  const userMap = new Map(users.map(u => [Number(u._id), u]));
+
+  const assignmentsByTask = new Map();
+  for (const a of assignments) {
+    const key = Number(a.task_id);
+    if (!assignmentsByTask.has(key)) assignmentsByTask.set(key, []);
+    assignmentsByTask.get(key).push(a);
+  }
+
+  const reportRows = [];
+  for (const task of tasks) {
+    const taskAssignments = assignmentsByTask.get(Number(task._id)) || [];
+    const assigner = userMap.get(Number(task.assigned_by));
+    // LEFT JOIN semantics: emit one row even when the task has no planner assignment yet.
+    const rowsForTask = taskAssignments.length ? taskAssignments : [null];
+
+    for (const assignment of rowsForTask) {
+      const rowPlannerId = assignment ? assignment.planner_id : task.assigned_to;
+      const plannerUser = userMap.get(Number(rowPlannerId));
+      const brandOrAgencyName = String(task.direct_client_or_agency || '').toLowerCase() === 'ad agency'
+        ? (task.agency_name || task.brand_name || task.client_name || '')
+        : (task.brand_name || task.client_name || task.agency_name || '');
+      const planAssignedAt = assignment
+        ? assignment.created_at
+        : (plannerUser?.role === 'planner' ? task.created_at : null);
+      const planCompletedAt = assignment
+        ? assignment.completed_at
+        : (plannerUser?.role === 'planner' && task.status === 'Completed' ? task.completed_at : null);
+
+      reportRows.push({
+        _rowPlannerId: rowPlannerId,
+        request_received_at: task.created_at,
+        task_code: task.task_code,
+        brand_or_agency_name: brandOrAgencyName,
+        customer_type: task.direct_client_or_agency || '',
+        plan_required: task.plan_format || '',
+        assigned_by_name: assigner?.name || '',
+        planner_name: plannerUser?.role === 'planner' ? (plannerUser.name || '') : '',
+        target_areas: assignment?.assigned_locations || task.target_areas || '',
+        plan_assigned_at: planAssignedAt,
+        plan_completed_at: planCompletedAt,
+        assignment_status: assignment ? assignment.status : task.status,
+        conversion_status: task.conversion_status || 'Pending'
+      });
+    }
+  }
+
+  // The task-level filter above casts a slightly wider net for planners (any task
+  // they have ever been assigned to); narrow to just their own row here, matching
+  // the original per-row SQL filter so a planner never sees another planner's row.
+  const filteredRows = req.user.role === 'planner'
+    ? reportRows.filter(row => Number(row._rowPlannerId) === Number(req.user.id))
+    : reportRows;
 
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'ADINN Planning Task Manager';
@@ -1780,7 +1924,7 @@ app.get('/api/reports/export', requireAuth, asyncHandler(async (req, res) => {
     worksheet.getColumn(index + 1).width = width;
   });
 
-  reportRows.forEach((item, index) => {
+  filteredRows.forEach((item, index) => {
     const requestReceived = reportDateTimeParts(item.request_received_at);
     const planAssigned = reportDateTimeParts(item.plan_assigned_at);
     const planCompleted = reportDateTimeParts(item.plan_completed_at);
@@ -1875,10 +2019,9 @@ app.use((err, _req, res, _next) => {
 
 async function start() {
   await initDb();
-  await validateSupabaseStorage();
   app.listen(PORT, () => {
     console.log(`ADINN Planning Task Manager API running on http://localhost:${PORT}`);
-    console.log(`Task attachments are stored in Supabase bucket: ${SUPABASE_STORAGE_BUCKET}`);
+    console.log('Task attachments are stored in MongoDB GridFS (bucket: task_attachments)');
   });
 }
 

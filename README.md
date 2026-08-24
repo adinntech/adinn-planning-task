@@ -9,18 +9,19 @@ A white ADINN-themed planning work allocation and tracker for the Planning Desk.
 - Planners can accept or decline with reason.
 - Admin can create, deactivate, activate, and permanently delete users.
 - Planner planning options can be selected as Outdoor and/or Roadshow.
-- Data is now stored in PostgreSQL using `DATABASE_URL`, so production data is safer than local SQLite.
+- Data is stored in MongoDB Atlas using `MONGODB_URI`. Task attachments are stored in MongoDB GridFS.
 
 ## Tech stack
 
 - Frontend: React + Vite
 - Backend: Node.js + Express
-- Database: PostgreSQL via `pg`
+- Database: MongoDB Atlas via `mongoose`
+- File storage: MongoDB GridFS
 - Auth: JWT
 
 ## Required database
 
-Create a PostgreSQL database first. Supabase, Neon, Railway PostgreSQL, Render PostgreSQL, or any managed PostgreSQL will work.
+Create a free MongoDB Atlas cluster at https://www.mongodb.com/cloud/atlas. It must be a replica set (every Atlas cluster is), since task creation and several updates run inside multi-document transactions.
 
 Set this in `backend/.env`:
 
@@ -28,16 +29,13 @@ Set this in `backend/.env`:
 PORT=5001
 JWT_SECRET=change-this-to-a-long-random-secret
 CORS_ORIGIN=http://localhost:5173
-DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DATABASE
-DB_SSL=true
+MONGODB_URI=mongodb+srv://USER:PASSWORD@YOUR_CLUSTER.mongodb.net/adinn_planning?retryWrites=true&w=majority
 UPLOAD_DIR=./uploads
+FILE_TOKEN_SECRET=change-this-to-a-different-long-random-secret
+FILE_LINK_SECONDS=3600
 ```
 
-For local PostgreSQL without SSL, set:
-
-```env
-DB_SSL=false
-```
+`FILE_TOKEN_SECRET` signs the short-lived links used to download/preview task attachments stored in GridFS; it defaults to `JWT_SECRET` if left unset.
 
 ## Install
 
@@ -108,12 +106,13 @@ Environment variables:
 ```env
 JWT_SECRET=your-long-production-secret
 CORS_ORIGIN=https://your-vercel-url.vercel.app
-DATABASE_URL=your-postgresql-connection-string
-DB_SSL=true
+MONGODB_URI=your-mongodb-atlas-connection-string
 UPLOAD_DIR=/data/uploads
+FILE_TOKEN_SECRET=your-long-production-file-link-secret
+FILE_LINK_SECONDS=3600
 ```
 
-For file uploads on Render, add a persistent disk mounted at `/data` if you want uploaded files to survive redeploys.
+Task attachments are stored in MongoDB GridFS, not on disk, so `UPLOAD_DIR` only needs to hold temporary files during an upload — a persistent disk is not required for attachments to survive redeploys.
 
 ### Vercel frontend
 
@@ -154,7 +153,7 @@ VITE_API_URL=https://your-render-backend-url.onrender.com/api
 
 - Protected admin accounts cannot be deactivated or deleted from the Users page.
 - Backend also blocks admin deactivation, deletion, and role conversion for safety.
-- If an admin was deactivated earlier, reactivate it in Supabase with: `UPDATE users SET status = 'active' WHERE role = 'admin';`
+- If an admin was deactivated earlier, reactivate it in MongoDB Atlas (Data Explorer or `mongosh`) with: `db.users.updateMany({ role: 'admin' }, { $set: { status: 'active' } })`
 
 ## Planning Lead Workflow Update
 

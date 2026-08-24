@@ -1,4 +1,4 @@
-const { Pool } = require('pg');
+const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 require('dotenv').config();
 
@@ -6,373 +6,280 @@ function now() {
   return new Date().toISOString();
 }
 
-function getSslConfig(connectionString) {
-  if (process.env.DB_SSL === 'false') return false;
-  if (!connectionString) return false;
-  if (connectionString.includes('localhost') || connectionString.includes('127.0.0.1')) return false;
-  return { rejectUnauthorized: false };
-}
-
-const connectionString = process.env.DATABASE_URL;
+const connectionString = process.env.MONGODB_URI;
 
 if (!connectionString) {
-  console.warn('DATABASE_URL is not set. Add a PostgreSQL connection string in backend/.env before starting the backend.');
-}
-
-const pool = new Pool({
-  connectionString,
-  ssl: getSslConfig(connectionString)
-});
-
-async function query(sql, params = []) {
-  return pool.query(sql, params);
-}
-
-async function one(sql, params = []) {
-  const result = await query(sql, params);
-  return result.rows[0] || null;
-}
-
-async function many(sql, params = []) {
-  const result = await query(sql, params);
-  return result.rows;
-}
-
-async function exec(sql, params = []) {
-  return query(sql, params);
-}
-
-async function withTransaction(callback) {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const tx = {
-      query: (sql, params = []) => client.query(sql, params),
-      one: async (sql, params = []) => {
-        const result = await client.query(sql, params);
-        return result.rows[0] || null;
-      },
-      many: async (sql, params = []) => {
-        const result = await client.query(sql, params);
-        return result.rows;
-      }
-    };
-    const result = await callback(tx);
-    await client.query('COMMIT');
-    return result;
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
-  }
+  console.warn('MONGODB_URI is not set. Add a MongoDB Atlas connection string in backend/.env before starting the backend.');
 }
 
 function hashPassword(password) {
   return bcrypt.hashSync(password, 10);
 }
 
-async function createSchema() {
-  await query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id SERIAL PRIMARY KEY,
-      name TEXT NOT NULL,
-      email TEXT NOT NULL UNIQUE,
-      password_hash TEXT NOT NULL,
-      role TEXT NOT NULL CHECK(role IN ('admin', 'manager', 'planning_lead', 'planner')),
-      department TEXT DEFAULT 'Planning',
-      phone TEXT DEFAULT '',
-      verticals TEXT DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'inactive')),
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
+const jsonTransform = (_doc, ret) => {
+  ret.id = ret._id;
+  delete ret._id;
+  delete ret.__v;
+  return ret;
+};
 
-    CREATE TABLE IF NOT EXISTS tasks (
-      id SERIAL PRIMARY KEY,
-      task_code TEXT NOT NULL UNIQUE,
-      title TEXT NOT NULL DEFAULT 'Planning Request',
-      client_name TEXT DEFAULT '',
-      brand_name TEXT DEFAULT '',
-      direct_client_or_agency TEXT DEFAULT '',
-      agency_name TEXT DEFAULT '',
-      campaign_name TEXT DEFAULT '',
-      campaign_type TEXT DEFAULT '',
-      city TEXT DEFAULT '',
-      state TEXT DEFAULT '',
-      category TEXT DEFAULT '',
-      deliverable TEXT DEFAULT '',
-      description TEXT DEFAULT '',
-      priority TEXT NOT NULL DEFAULT 'Medium' CHECK(priority IN ('Low', 'Medium', 'High', 'Urgent')),
-      status TEXT NOT NULL DEFAULT 'Pending Acceptance',
-      assigned_by INTEGER NOT NULL REFERENCES users(id),
-      assigned_to INTEGER NOT NULL REFERENCES users(id),
-      planning_lead_id INTEGER REFERENCES users(id),
-      start_date TEXT DEFAULT '',
-      due_date TEXT DEFAULT '',
-      campaign_start_date TEXT DEFAULT '',
-      campaign_duration TEXT DEFAULT '',
-      campaign_budget TEXT DEFAULT '',
-      display_cost_range TEXT DEFAULT '',
-      target_areas TEXT DEFAULT '',
-      target_audience_profile TEXT DEFAULT '',
-      site_preferences TEXT DEFAULT '',
-      ownership_type TEXT DEFAULT '',
-      location_type TEXT DEFAULT '',
-      size_preference TEXT DEFAULT '',
-      additional_specifications TEXT DEFAULT '',
-      plan_format TEXT DEFAULT '',
-      submission_deadline TEXT DEFAULT '',
-      accepted_at TEXT,
-      declined_at TEXT,
-      submitted_at TEXT,
-      completed_at TEXT,
-      conversion_status TEXT NOT NULL DEFAULT 'Pending',
-      rework_count INTEGER DEFAULT 0,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
+const schemaOptions = {
+  id: false,
+  toJSON: { transform: jsonTransform },
+  toObject: { transform: jsonTransform }
+};
 
-    CREATE TABLE IF NOT EXISTS task_planner_assignments (
-      id SERIAL PRIMARY KEY,
-      task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-      planner_id INTEGER NOT NULL REFERENCES users(id),
-      assigned_by INTEGER NOT NULL REFERENCES users(id),
-      assigned_locations TEXT DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'Pending Acceptance',
-      accepted_at TEXT,
-      declined_at TEXT,
-      completed_at TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      UNIQUE(task_id, planner_id)
-    );
+// ---------------------------------------------------------------------------
+// Counters (replaces SERIAL auto-increment primary keys)
+// ---------------------------------------------------------------------------
 
-    CREATE TABLE IF NOT EXISTS task_comments (
-      id SERIAL PRIMARY KEY,
-      task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-      user_id INTEGER NOT NULL REFERENCES users(id),
-      comment TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
+const counterSchema = new mongoose.Schema({
+  _id: { type: String, required: true },
+  seq: { type: Number, default: 0 }
+});
+const Counter = mongoose.model('Counter', counterSchema);
 
-    CREATE TABLE IF NOT EXISTS task_files (
-      id SERIAL PRIMARY KEY,
-      task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-      user_id INTEGER NOT NULL REFERENCES users(id),
-      file_name TEXT NOT NULL,
-      file_path TEXT NOT NULL,
-      file_type TEXT DEFAULT '',
-      file_size INTEGER DEFAULT 0,
-      storage_provider TEXT NOT NULL DEFAULT 'local',
-      created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS task_status_history (
-      id SERIAL PRIMARY KEY,
-      task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-      user_id INTEGER NOT NULL REFERENCES users(id),
-      action TEXT NOT NULL,
-      old_status TEXT,
-      new_status TEXT,
-      remarks TEXT DEFAULT '',
-      created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS task_declines (
-      id SERIAL PRIMARY KEY,
-      task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-      planner_id INTEGER NOT NULL REFERENCES users(id),
-      reason TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS notifications (
-      id SERIAL PRIMARY KEY,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
-      title TEXT NOT NULL,
-      message TEXT NOT NULL,
-      type TEXT NOT NULL DEFAULT 'task_update',
-      is_read BOOLEAN NOT NULL DEFAULT FALSE,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);
-    CREATE INDEX IF NOT EXISTS idx_notifications_user_read ON notifications(user_id, is_read);
-    CREATE INDEX IF NOT EXISTS idx_notifications_task ON notifications(task_id);
-
-    CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-    CREATE INDEX IF NOT EXISTS idx_tasks_assigned_by ON tasks(assigned_by);
-    CREATE INDEX IF NOT EXISTS idx_tasks_assigned_to ON tasks(assigned_to);
-    CREATE INDEX IF NOT EXISTS idx_tasks_deadline ON tasks(submission_deadline);
-    CREATE INDEX IF NOT EXISTS idx_task_planner_assignments_task ON task_planner_assignments(task_id);
-    CREATE INDEX IF NOT EXISTS idx_task_planner_assignments_planner ON task_planner_assignments(planner_id);
-    CREATE INDEX IF NOT EXISTS idx_task_planner_assignments_status ON task_planner_assignments(status);
-  `);
-}
-
-async function addColumnIfMissing(tableName, columnName, columnDefinition) {
-  const row = await one(
-    `SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2`,
-    [tableName, columnName]
+async function nextId(name, session = null) {
+  const options = { upsert: true, new: true, setDefaultsOnInsert: true };
+  if (session) options.session = session;
+  const counter = await Counter.findOneAndUpdate(
+    { _id: name },
+    { $inc: { seq: 1 } },
+    options
   );
-  if (!row) {
-    await query(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnDefinition}`);
+  return counter.seq;
+}
+
+async function nextTaskCode(session) {
+  const d = new Date();
+  const stamp = `${String(d.getFullYear()).slice(2)}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+  const counterId = `task-code:${stamp}`;
+  const counter = await Counter.findOneAndUpdate(
+    { _id: counterId },
+    { $inc: { seq: 1 } },
+    { upsert: true, new: true, setDefaultsOnInsert: true, session }
+  );
+  return `PLN-${stamp}-${String(counter.seq).padStart(3, '0')}`;
+}
+
+// ---------------------------------------------------------------------------
+// Schemas
+// ---------------------------------------------------------------------------
+
+const userSchema = new mongoose.Schema({
+  _id: { type: Number },
+  name: { type: String, required: true },
+  email: { type: String, required: true, unique: true },
+  password_hash: { type: String, required: true },
+  role: { type: String, required: true, enum: ['admin', 'manager', 'planning_lead', 'planner'] },
+  department: { type: String, default: 'Planning' },
+  phone: { type: String, default: '' },
+  verticals: { type: String, default: '' },
+  status: { type: String, required: true, enum: ['active', 'inactive'], default: 'active' },
+  created_at: { type: String, required: true },
+  updated_at: { type: String, required: true }
+}, schemaOptions);
+const User = mongoose.model('User', userSchema);
+
+const taskSchema = new mongoose.Schema({
+  _id: { type: Number },
+  task_code: { type: String, required: true, unique: true },
+  title: { type: String, default: 'Planning Request' },
+  client_name: { type: String, default: '' },
+  brand_name: { type: String, default: '' },
+  direct_client_or_agency: { type: String, default: '' },
+  agency_name: { type: String, default: '' },
+  campaign_name: { type: String, default: '' },
+  campaign_type: { type: String, default: '' },
+  city: { type: String, default: '' },
+  state: { type: String, default: '' },
+  category: { type: String, default: '' },
+  deliverable: { type: String, default: '' },
+  description: { type: String, default: '' },
+  priority: { type: String, required: true, enum: ['Low', 'Medium', 'High', 'Urgent'], default: 'Medium' },
+  status: { type: String, required: true, default: 'Pending Acceptance' },
+  assigned_by: { type: Number, ref: 'User', required: true },
+  assigned_to: { type: Number, ref: 'User', required: true },
+  planning_lead_id: { type: Number, ref: 'User', default: null },
+  start_date: { type: String, default: '' },
+  due_date: { type: String, default: '' },
+  campaign_start_date: { type: String, default: '' },
+  campaign_duration: { type: String, default: '' },
+  campaign_budget: { type: String, default: '' },
+  display_cost_range: { type: String, default: '' },
+  target_areas: { type: String, default: '' },
+  target_audience_profile: { type: String, default: '' },
+  site_preferences: { type: String, default: '' },
+  ownership_type: { type: String, default: '' },
+  location_type: { type: String, default: '' },
+  size_preference: { type: String, default: '' },
+  additional_specifications: { type: String, default: '' },
+  plan_format: { type: String, default: '' },
+  submission_deadline: { type: String, default: '' },
+  accepted_at: { type: String, default: null },
+  declined_at: { type: String, default: null },
+  submitted_at: { type: String, default: null },
+  completed_at: { type: String, default: null },
+  conversion_status: { type: String, required: true, default: 'Pending' },
+  rework_count: { type: Number, default: 0 },
+  created_at: { type: String, required: true },
+  updated_at: { type: String, required: true }
+}, schemaOptions);
+taskSchema.index({ status: 1 });
+taskSchema.index({ assigned_by: 1 });
+taskSchema.index({ assigned_to: 1 });
+taskSchema.index({ submission_deadline: 1 });
+const Task = mongoose.model('Task', taskSchema);
+
+const taskPlannerAssignmentSchema = new mongoose.Schema({
+  _id: { type: Number },
+  task_id: { type: Number, ref: 'Task', required: true },
+  planner_id: { type: Number, ref: 'User', required: true },
+  assigned_by: { type: Number, ref: 'User', required: true },
+  assigned_locations: { type: String, default: '' },
+  status: { type: String, required: true, default: 'Pending Acceptance' },
+  accepted_at: { type: String, default: null },
+  declined_at: { type: String, default: null },
+  completed_at: { type: String, default: null },
+  created_at: { type: String, required: true },
+  updated_at: { type: String, required: true }
+}, schemaOptions);
+taskPlannerAssignmentSchema.index({ task_id: 1, planner_id: 1 }, { unique: true });
+taskPlannerAssignmentSchema.index({ planner_id: 1 });
+taskPlannerAssignmentSchema.index({ status: 1 });
+const TaskPlannerAssignment = mongoose.model('TaskPlannerAssignment', taskPlannerAssignmentSchema);
+
+const taskCommentSchema = new mongoose.Schema({
+  _id: { type: Number },
+  task_id: { type: Number, ref: 'Task', required: true },
+  user_id: { type: Number, ref: 'User', required: true },
+  comment: { type: String, required: true },
+  created_at: { type: String, required: true }
+}, schemaOptions);
+taskCommentSchema.index({ task_id: 1 });
+const TaskComment = mongoose.model('TaskComment', taskCommentSchema);
+
+const taskFileSchema = new mongoose.Schema({
+  _id: { type: Number },
+  task_id: { type: Number, ref: 'Task', required: true },
+  user_id: { type: Number, ref: 'User', required: true },
+  file_name: { type: String, required: true },
+  file_path: { type: String, required: true },
+  file_type: { type: String, default: '' },
+  file_size: { type: Number, default: 0 },
+  storage_provider: { type: String, required: true, default: 'local' },
+  gridfs_id: { type: mongoose.Schema.Types.ObjectId, default: null },
+  created_at: { type: String, required: true }
+}, schemaOptions);
+taskFileSchema.index({ task_id: 1 });
+const TaskFile = mongoose.model('TaskFile', taskFileSchema);
+
+const taskStatusHistorySchema = new mongoose.Schema({
+  _id: { type: Number },
+  task_id: { type: Number, ref: 'Task', required: true },
+  user_id: { type: Number, ref: 'User', required: true },
+  action: { type: String, required: true },
+  old_status: { type: String, default: null },
+  new_status: { type: String, default: null },
+  remarks: { type: String, default: '' },
+  created_at: { type: String, required: true }
+}, schemaOptions);
+taskStatusHistorySchema.index({ task_id: 1 });
+const TaskStatusHistory = mongoose.model('TaskStatusHistory', taskStatusHistorySchema);
+
+const taskDeclineSchema = new mongoose.Schema({
+  _id: { type: Number },
+  task_id: { type: Number, ref: 'Task', required: true },
+  planner_id: { type: Number, ref: 'User', required: true },
+  reason: { type: String, required: true },
+  created_at: { type: String, required: true }
+}, schemaOptions);
+taskDeclineSchema.index({ task_id: 1 });
+const TaskDecline = mongoose.model('TaskDecline', taskDeclineSchema);
+
+const notificationSchema = new mongoose.Schema({
+  _id: { type: Number },
+  user_id: { type: Number, ref: 'User', required: true },
+  task_id: { type: Number, ref: 'Task', default: null },
+  title: { type: String, required: true },
+  message: { type: String, required: true },
+  type: { type: String, required: true, default: 'task_update' },
+  is_read: { type: Boolean, required: true, default: false },
+  created_at: { type: String, required: true }
+}, schemaOptions);
+notificationSchema.index({ user_id: 1 });
+notificationSchema.index({ user_id: 1, is_read: 1 });
+notificationSchema.index({ task_id: 1 });
+const Notification = mongoose.model('Notification', notificationSchema);
+
+// ---------------------------------------------------------------------------
+// Transaction helper (replaces the pg withTransaction wrapper)
+// ---------------------------------------------------------------------------
+
+async function withTransaction(callback) {
+  const session = await mongoose.startSession();
+  try {
+    let result;
+    await session.withTransaction(async () => {
+      result = await callback(session);
+    });
+    return result;
+  } finally {
+    await session.endSession();
   }
 }
 
+// ---------------------------------------------------------------------------
+// Shared write helpers used across the app
+// ---------------------------------------------------------------------------
 
-async function ensureRoleConstraintSupportsPlanningLead() {
-  const constraints = await many(`
-    SELECT conname
-    FROM pg_constraint
-    WHERE conrelid = 'users'::regclass
-      AND contype = 'c'
-      AND pg_get_constraintdef(oid) ILIKE '%role%'
-  `);
-
-  for (const constraint of constraints) {
-    await query(`ALTER TABLE users DROP CONSTRAINT IF EXISTS ${constraint.conname}`);
-  }
-
-  await query(`
-    ALTER TABLE users
-    ADD CONSTRAINT users_role_check
-    CHECK (role IN ('admin', 'manager', 'planning_lead', 'planner'))
-  `);
+async function addHistory(taskId, userId, action, oldStatus, newStatus, remarks = '') {
+  const id = await nextId('task_status_history');
+  await TaskStatusHistory.create({
+    _id: id,
+    task_id: taskId,
+    user_id: userId,
+    action,
+    old_status: oldStatus,
+    new_status: newStatus,
+    remarks,
+    created_at: now()
+  });
 }
 
-async function runMigrations() {
-  await ensureRoleConstraintSupportsPlanningLead();
-  const taskColumns = [
-    ['direct_client_or_agency', "TEXT DEFAULT ''"],
-    ['agency_name', "TEXT DEFAULT ''"],
-    ['campaign_start_date', "TEXT DEFAULT ''"],
-    ['campaign_duration', "TEXT DEFAULT ''"],
-    ['campaign_budget', "TEXT DEFAULT ''"],
-    ['display_cost_range', "TEXT DEFAULT ''"],
-    ['target_areas', "TEXT DEFAULT ''"],
-    ['target_audience_profile', "TEXT DEFAULT ''"],
-    ['site_preferences', "TEXT DEFAULT ''"],
-    ['ownership_type', "TEXT DEFAULT ''"],
-    ['location_type', "TEXT DEFAULT ''"],
-    ['size_preference', "TEXT DEFAULT ''"],
-    ['additional_specifications', "TEXT DEFAULT ''"],
-    ['plan_format', "TEXT DEFAULT ''"],
-    ['submission_deadline', "TEXT DEFAULT ''"],
-    ['accepted_at', 'TEXT'],
-    ['declined_at', 'TEXT'],
-    ['submitted_at', 'TEXT'],
-    ['completed_at', 'TEXT'],
-    ['conversion_status', "TEXT NOT NULL DEFAULT 'Pending'"],
-    ['rework_count', 'INTEGER DEFAULT 0'],
-    ['planning_lead_id', 'INTEGER REFERENCES users(id)']
-  ];
-
-  for (const [name, definition] of taskColumns) {
-    await addColumnIfMissing('tasks', name, definition);
-  }
-
-  await addColumnIfMissing('users', 'verticals', "TEXT DEFAULT ''");
-  await addColumnIfMissing('task_files', 'storage_provider', "TEXT NOT NULL DEFAULT 'local'");
-
-  // Keep conversion values consistent even when an older preview/conversion
-  // experiment previously created this column with different casing or labels.
-  await query(`
-    UPDATE tasks
-    SET conversion_status = CASE
-      WHEN LOWER(COALESCE(conversion_status, '')) IN ('won', 'plan converted', 'converted') THEN 'Won'
-      WHEN LOWER(COALESCE(conversion_status, '')) IN ('loss', 'lost', 'plan not converted', 'not converted') THEN 'Loss'
-      ELSE 'Pending'
-    END
-  `);
-  await query(`ALTER TABLE tasks ALTER COLUMN conversion_status SET DEFAULT 'Pending'`);
-  await query(`ALTER TABLE tasks ALTER COLUMN conversion_status SET NOT NULL`);
-
-  // Preserve every existing single-planner task by creating one assignment row.
-  // New tasks can then add more planners without breaking older records.
-  await query(`
-    INSERT INTO task_planner_assignments (
-      task_id, planner_id, assigned_by, assigned_locations, status,
-      accepted_at, declined_at, completed_at, created_at, updated_at
-    )
-    SELECT
-      t.id,
-      t.assigned_to,
-      COALESCE(t.planning_lead_id, t.assigned_by),
-      COALESCE(t.target_areas, ''),
-      CASE
-        WHEN t.status IN ('Pending Acceptance', 'Accepted', 'In Progress', 'Waiting for Details', 'Completed', 'Declined') THEN t.status
-        WHEN t.status = 'Rework Required' THEN 'Pending Acceptance'
-        ELSE 'In Progress'
-      END,
-      t.accepted_at,
-      t.declined_at,
-      t.completed_at,
-      t.created_at,
-      t.updated_at
-    FROM tasks t
-    JOIN users u ON u.id = t.assigned_to AND u.role = 'planner'
-    ON CONFLICT (task_id, planner_id) DO NOTHING
-  `);
+async function generateTaskCode(session) {
+  return nextTaskCode(session);
 }
+
+// ---------------------------------------------------------------------------
+// Startup: connect, sync indexes, seed default users
+// ---------------------------------------------------------------------------
 
 async function insertUser({ name, email, password, role, department = 'Planning', phone = '', verticals = '' }) {
   const timestamp = now();
-  const row = await one(
-    `INSERT INTO users (name, email, password_hash, role, department, phone, verticals, status, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9)
-     RETURNING id`,
-    [name, email.toLowerCase(), hashPassword(password), role, department, phone, verticals, timestamp, timestamp]
-  );
-  return row.id;
-}
-
-async function addHistory(taskId, userId, action, oldStatus, newStatus, remarks = '') {
-  await query(
-    `INSERT INTO task_status_history (task_id, user_id, action, old_status, new_status, remarks, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-    [taskId, userId, action, oldStatus, newStatus, remarks, now()]
-  );
-}
-
-async function generateTaskCode(tx) {
-  if (!tx?.query || !tx?.one) {
-    throw new Error('generateTaskCode must be called inside a database transaction');
-  }
-
-  const d = new Date();
-  const stamp = `${String(d.getFullYear()).slice(2)}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
-  const prefix = `PLN-${stamp}-`;
-
-  // Lock task-code generation for this date until the task insert commits.
-  // This prevents two simultaneous requests from receiving the same code.
-  await tx.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`planning-task-code:${stamp}`]);
-
-  // MAX is used instead of COUNT so deleted tasks or gaps cannot recreate an
-  // already-used task code.
-  const row = await tx.one(`
-    SELECT COALESCE(MAX(
-      CASE
-        WHEN split_part(task_code, '-', 3) ~ '^[0-9]+$'
-          THEN split_part(task_code, '-', 3)::integer
-        ELSE 0
-      END
-    ), 0)::int AS max_number
-    FROM tasks
-    WHERE task_code LIKE $1
-  `, [`${prefix}%`]);
-
-  return `${prefix}${String((row?.max_number || 0) + 1).padStart(3, '0')}`;
+  const id = await nextId('users');
+  const created = await User.create({
+    _id: id,
+    name,
+    email: email.toLowerCase(),
+    password_hash: hashPassword(password),
+    role,
+    department,
+    phone,
+    verticals,
+    status: 'active',
+    created_at: timestamp,
+    updated_at: timestamp
+  });
+  return created._id;
 }
 
 async function ensureDefaultUser({ name, email, password, role, department = 'Planning', phone = '', verticals = '' }) {
-  const existing = await one('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
+  const existing = await User.findOne({ email: email.toLowerCase() });
   if (existing) {
     // Never reactivate or overwrite an existing account during application startup.
     // Account status changes must remain under explicit Admin control.
-    return existing.id;
+    return existing._id;
   }
   return insertUser({ name, email, password, role, department, phone, verticals });
 }
@@ -381,23 +288,24 @@ async function migrateDefaultBDUser() {
   const timestamp = now();
   const bdEmail = 'bd@adinn.co.in';
   const oldManagerEmail = 'manager@adinn.co.in';
-  const bdUser = await one('SELECT * FROM users WHERE email = $1', [bdEmail]);
-  const oldManager = await one('SELECT * FROM users WHERE email = $1', [oldManagerEmail]);
+  const bdUser = await User.findOne({ email: bdEmail });
+  const oldManager = await User.findOne({ email: oldManagerEmail });
 
   if (bdUser) {
     // The migration has already been completed. Preserve the account exactly as
     // the Admin left it, including an inactive status.
-    return bdUser.id;
+    return bdUser._id;
   }
 
   if (oldManager) {
-    await query(
-      `UPDATE users
-       SET name = $1, email = $2, password_hash = $3, role = 'manager', department = 'Planning', updated_at = $4
-       WHERE id = $5`,
-      ['Business Developer', bdEmail, hashPassword('BD@123'), timestamp, oldManager.id]
-    );
-    return oldManager.id;
+    oldManager.name = 'Business Developer';
+    oldManager.email = bdEmail;
+    oldManager.password_hash = hashPassword('BD@123');
+    oldManager.role = 'manager';
+    oldManager.department = 'Planning';
+    oldManager.updated_at = timestamp;
+    await oldManager.save();
+    return oldManager._id;
   }
 
   return null;
@@ -453,23 +361,38 @@ async function seedDefaultUsers() {
 
 async function initDb() {
   if (!connectionString) {
-    throw new Error('DATABASE_URL is missing. Create a PostgreSQL database and add DATABASE_URL in backend/.env or Render environment variables.');
+    throw new Error('MONGODB_URI is missing. Create a MongoDB Atlas database and add MONGODB_URI in backend/.env or Render environment variables.');
   }
-  await createSchema();
-  await runMigrations();
+  await mongoose.connect(connectionString);
+  await Promise.all([
+    User.syncIndexes(),
+    Task.syncIndexes(),
+    TaskPlannerAssignment.syncIndexes(),
+    TaskComment.syncIndexes(),
+    TaskFile.syncIndexes(),
+    TaskStatusHistory.syncIndexes(),
+    TaskDecline.syncIndexes(),
+    Notification.syncIndexes()
+  ]);
   await seedDefaultUsers();
 }
 
 module.exports = {
-  pool,
-  query,
-  one,
-  many,
-  exec,
-  withTransaction,
+  mongoose,
   initDb,
   now,
   hashPassword,
   addHistory,
-  generateTaskCode
+  generateTaskCode,
+  withTransaction,
+  nextId,
+  Counter,
+  User,
+  Task,
+  TaskPlannerAssignment,
+  TaskComment,
+  TaskFile,
+  TaskStatusHistory,
+  TaskDecline,
+  Notification
 };

@@ -1,6 +1,6 @@
 # ADINN Planning Task Manager Backend
 
-This backend uses PostgreSQL. Add `DATABASE_URL` before running.
+This backend uses MongoDB Atlas. Add `MONGODB_URI` before running.
 
 ```bash
 cp .env.example .env

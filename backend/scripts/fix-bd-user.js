@@ -1,27 +1,36 @@
-const { initDb, query, one, hashPassword, now, pool } = require('../src/database');
+const { initDb, User, hashPassword, now, mongoose } = require('../src/database');
 
 async function main() {
   await initDb();
   const timestamp = now();
-  const oldManager = await one('SELECT * FROM users WHERE email = $1', ['manager@adinn.co.in']);
-  const bd = await one('SELECT * FROM users WHERE email = $1', ['bd@adinn.co.in']);
+  const oldManager = await User.findOne({ email: 'manager@adinn.co.in' });
+  const bd = await User.findOne({ email: 'bd@adinn.co.in' });
 
   if (oldManager && !bd) {
-    await query(
-      `UPDATE users SET name = $1, email = $2, password_hash = $3, role = 'manager', department = 'Planning', status = 'active', updated_at = $4 WHERE id = $5`,
-      ['Business Developer', 'bd@adinn.co.in', hashPassword('BD@123'), timestamp, oldManager.id]
-    );
+    oldManager.name = 'Business Developer';
+    oldManager.email = 'bd@adinn.co.in';
+    oldManager.password_hash = hashPassword('BD@123');
+    oldManager.role = 'manager';
+    oldManager.department = 'Planning';
+    oldManager.status = 'active';
+    oldManager.updated_at = timestamp;
+    await oldManager.save();
   }
 
   if (bd) {
-    await query(
-      `UPDATE users SET name = 'Business Developer', password_hash = $1, role = 'manager', department = 'Planning', status = 'active', updated_at = $2 WHERE id = $3`,
-      [hashPassword('BD@123'), timestamp, bd.id]
-    );
+    bd.name = 'Business Developer';
+    bd.password_hash = hashPassword('BD@123');
+    bd.role = 'manager';
+    bd.department = 'Planning';
+    bd.status = 'active';
+    bd.updated_at = timestamp;
+    await bd.save();
   }
 
   if (oldManager && bd) {
-    await query('UPDATE users SET status = $1, updated_at = $2 WHERE id = $3', ['inactive', timestamp, oldManager.id]);
+    oldManager.status = 'inactive';
+    oldManager.updated_at = timestamp;
+    await oldManager.save();
   }
 
   console.log('BD user verified. Login: bd@adinn.co.in / BD@123');
@@ -33,5 +42,5 @@ main()
     process.exitCode = 1;
   })
   .finally(async () => {
-    await pool.end();
+    await mongoose.disconnect();
   });
