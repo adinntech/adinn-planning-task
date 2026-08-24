@@ -675,6 +675,11 @@ app.get('/files/:fileId', asyncHandler(async (req, res) => {
   const fileDoc = await TaskFile.findOne({ gridfs_id: objectId }).lean();
   if (!fileDoc) return res.status(404).json({ message: 'File not found' });
 
+  // The default Content-Security-Policy (from helmet) sends frame-ancestors 'self',
+  // which blocks the frontend (a different origin) from embedding this response in
+  // an <iframe> for the preview modal. Relax it just for this route, scoped to the
+  // configured frontend origins, so PDF/document previews can actually render.
+  res.setHeader('Content-Security-Policy', `frame-ancestors 'self' ${allowedOrigins.join(' ')}`.trim());
   res.setHeader('Content-Type', fileDoc.file_type || 'application/octet-stream');
   res.setHeader(
     'Content-Disposition',
