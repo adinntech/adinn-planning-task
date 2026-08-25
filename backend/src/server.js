@@ -7,6 +7,8 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const ExcelJS = require('exceljs');
+const { S3Client, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { Upload } = require('@aws-sdk/lib-storage');
 require('dotenv').config();
 
 const {
@@ -39,6 +41,68 @@ const FILE_LINK_SECONDS = Math.min(
 const uploadDir = path.resolve(process.cwd(), process.env.UPLOAD_DIR || './uploads');
 fs.mkdirSync(uploadDir, { recursive: true });
 
+// File storage backend for new uploads: 'space' (DigitalOcean Spaces, public-read)
+// or 'gridfs' (MongoDB GridFS). Existing records keep working via their own
+// storage_provider regardless of this setting.
+const STORAGE_TYPE = process.env.STORAGE_TYPE || 'gridfs';
+const DO_SPACES_BUCKET = process.env.DO_SPACES_BUCKET || 'adinn-space';
+const DO_SPACES_REGION = process.env.DO_SPACES_REGION || 'sgp1';
+const DO_SPACES_ENDPOINT = process.env.DO_SPACES_ENDPOINT || 'https://sgp1.digitaloceanspaces.com';
+const DO_SPACES_CDN_BASE = (process.env.DO_SPACES_CDN_BASE || `https://${DO_SPACES_BUCKET}.${DO_SPACES_REGION}.digitaloceanspaces.com`).replace(/\/+$/, '');
+
+const spacesClient = new S3Client({
+  region: DO_SPACES_REGION,
+  endpoint: DO_SPACES_ENDPOINT,
+  credentials: {
+    accessKeyId: process.env.DO_SPACES_KEY,
+    secretAccessKey: process.env.DO_SPACES_SECRET
+  },
+  forcePathStyle: false
+});
+
+function spacePublicUrl(key) {
+  return `${DO_SPACES_CDN_BASE}/${String(key || '').replace(/^\/+/, '')}`;
+}
+
+async function uploadSpaceFile(file, uploader) {
+  const safeName = path.basename(file.originalname || 'file').replace(/[^a-zA-Z0-9._-]/g, '_');
+  const safeUploaderName = String(uploader?.name || 'user')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'user';
+  const uploaderFolder = `${safeUploaderName}-${uploader?.id ?? 'unknown'}`;
+  const key = `Adinn-planning-task-attachments/${uploaderFolder}/${Date.now()}-${Math.round(Math.random() * 1e9)}-${safeName}`;
+  // Multipart upload with several parts in flight at once. Over a
+  // high-latency path (e.g. this server to the sgp1 Spaces endpoint), a
+  // single TCP stream often can't saturate the actual available bandwidth --
+  // running a few part uploads concurrently gets closer to it.
+  const upload = new Upload({
+    client: spacesClient,
+    params: {
+      Bucket: DO_SPACES_BUCKET,
+      Key: key,
+      Body: fs.createReadStream(file.path),
+      ContentType: file.mimetype || 'application/octet-stream',
+      ACL: 'public-read'
+    },
+    queueSize: 4,
+    partSize: 10 * 1024 * 1024
+  });
+  await upload.done();
+  return key;
+}
+
+async function removeSpaceFile(key, throwOnError = true) {
+  if (!key) return;
+  try {
+    await spacesClient.send(new DeleteObjectCommand({ Bucket: DO_SPACES_BUCKET, Key: key }));
+  } catch (error) {
+    if (throwOnError) throw new Error(`Unable to delete stored file: ${error.message}`);
+    console.error('Unable to clean up Space file', error);
+  }
+}
+
 let gridFsBucket = null;
 function getGridFsBucket() {
   if (!gridFsBucket) {
@@ -70,10 +134,11 @@ const storage = multer.diskStorage({
     cb(null, `${Date.now()}-${safeName}`);
   }
 });
+const MAX_FILE_SIZE_MB = Number(process.env.MAX_FILE_SIZE_MB) || 250;
 const upload = multer({
   storage,
   limits: {
-    fileSize: 50 * 1024 * 1024,
+    fileSize: MAX_FILE_SIZE_MB * 1024 * 1024,
     files: 10
   }
 });
@@ -162,6 +227,18 @@ async function attachmentResponse(file) {
           ? 'presentation'
           : 'browser';
 
+  if (file.storage_provider === 'space') {
+    const url = spacePublicUrl(file.file_path);
+    return {
+      ...file,
+      available: true,
+      preview_kind: previewKind,
+      preview_url: url,
+      download_url: url,
+      url
+    };
+  }
+
   if (file.storage_provider === 'gridfs') {
     if (!file.gridfs_id) {
       return {
@@ -201,6 +278,10 @@ async function attachmentResponse(file) {
 
 async function removeStoredFile(file, throwOnError = true) {
   if (!file) return;
+  if (file.storage_provider === 'space') {
+    await removeSpaceFile(file.file_path, throwOnError);
+    return;
+  }
   if (file.storage_provider === 'gridfs') {
     await removeGridFsFile(file.gridfs_id, throwOnError);
     return;
@@ -1204,52 +1285,113 @@ app.post('/api/tasks/:id/files', requireAuth, upload.fields([
   }
   if (uploadedFiles.length === 0) return res.status(400).json({ message: 'Select at least one file' });
 
-  const storedFiles = [];
-  try {
-    for (const file of uploadedFiles) {
-      const gridfsId = await uploadGridFsFile(file);
-      storedFiles.push({ file, gridfsId });
-    }
+  // By the time we get here, multer has already fully received the request
+  // body from the client (that leg is not visible to this timer). This timer
+  // isolates just the server -> storage (Spaces/GridFS) leg, so slow uploads
+  // can be diagnosed: small number here = bottleneck is the client's upload
+  // bandwidth to this server; large number here = bottleneck is this server's
+  // connection to the storage backend.
+  const totalBytes = uploadedFiles.reduce((sum, file) => sum + (file.size || 0), 0);
+  const storageUploadStartedAt = Date.now();
 
+  // Upload all files to storage concurrently (rather than one at a time) so a
+  // multi-file drag & drop doesn't wait on each file sequentially.
+  const uploadOutcomes = await Promise.allSettled(uploadedFiles.map(async (file) => {
+    if (STORAGE_TYPE === 'space') {
+      const spaceKey = await uploadSpaceFile(file, req.user);
+      return { file, storageProvider: 'space', filePath: spaceKey, gridfsId: null };
+    }
+    const gridfsId = await uploadGridFsFile(file);
+    return { file, storageProvider: 'gridfs', filePath: String(gridfsId), gridfsId };
+  }));
+
+  const storageUploadMs = Date.now() - storageUploadStartedAt;
+  console.log(
+    `[file-upload] task=${req.params.id} files=${uploadedFiles.length} totalSize=${(totalBytes / 1024 / 1024).toFixed(1)}MB `
+    + `storageType=${STORAGE_TYPE} serverToStorageMs=${storageUploadMs}`
+  );
+
+  const storedFiles = uploadOutcomes.filter(r => r.status === 'fulfilled').map(r => r.value);
+  const failedUpload = uploadOutcomes.find(r => r.status === 'rejected');
+
+  if (failedUpload) {
+    await Promise.all(storedFiles.map(item => (
+      item.storageProvider === 'space'
+        ? removeSpaceFile(item.filePath, false)
+        : removeGridFsFile(item.gridfsId, false)
+    )));
+    await Promise.all(uploadedFiles.map(file => removeLocalUpload(file.filename)));
+    throw failedUpload.reason;
+  }
+
+  try {
     await withTransaction(async (session) => {
-      for (const { file, gridfsId } of storedFiles) {
+      for (const { file, storageProvider, filePath, gridfsId } of storedFiles) {
         const id = await nextId('task_files', session);
         await TaskFile.create([{
           _id: id,
           task_id: task.id,
           user_id: req.user.id,
           file_name: file.originalname,
-          file_path: String(gridfsId),
+          file_path: filePath,
           file_type: file.mimetype,
           file_size: file.size,
-          storage_provider: 'gridfs',
+          storage_provider: storageProvider,
           gridfs_id: gridfsId,
           created_at: now()
         }], { session });
       }
     });
   } catch (error) {
-    await Promise.all(storedFiles.map(item => removeGridFsFile(item.gridfsId, false)));
+    await Promise.all(storedFiles.map(item => (
+      item.storageProvider === 'space'
+        ? removeSpaceFile(item.filePath, false)
+        : removeGridFsFile(item.gridfsId, false)
+    )));
     throw error;
   } finally {
     await Promise.all(uploadedFiles.map(file => removeLocalUpload(file.filename)));
   }
 
   const fileNames = uploadedFiles.map(file => file.originalname);
-  const summary = fileNames.length === 1 ? fileNames[0] : `${fileNames.length} files: ${fileNames.join(', ')}`;
-  await addHistory(task.id, req.user.id, fileNames.length === 1 ? 'File uploaded' : 'Files uploaded', task.status, task.status, summary);
-  await notifyUsers(
-    taskParticipantIds(task),
-    task.id,
-    fileNames.length === 1 ? 'File uploaded' : 'Files uploaded',
-    `${req.user.name} uploaded ${fileNames.length === 1 ? fileNames[0] : `${fileNames.length} files`} for ${taskDisplayName(task)}.`,
-    'file_uploaded',
-    req.user.id
-  );
+  // Callers uploading one file at a time as part of a client-side batch (so
+  // each file can show its own real progress/done/cancel state) pass
+  // silent=true on every request but the last, and instead call
+  // POST /api/tasks/:id/files/notify-batch once at the end so the whole
+  // batch produces exactly one history entry / notification.
+  if (req.body.silent !== 'true') {
+    const summary = fileNames.length === 1 ? fileNames[0] : `${fileNames.length} files: ${fileNames.join(', ')}`;
+    await addHistory(task.id, req.user.id, fileNames.length === 1 ? 'File uploaded' : 'Files uploaded', task.status, task.status, summary);
+    await notifyUsers(
+      taskParticipantIds(task),
+      task.id,
+      fileNames.length === 1 ? 'File uploaded' : 'Files uploaded',
+      `${req.user.name} uploaded ${fileNames.length === 1 ? fileNames[0] : `${fileNames.length} files`} for ${taskDisplayName(task)}.`,
+      'file_uploaded',
+      req.user.id
+    );
+  }
   res.status(201).json({
     message: fileNames.length === 1 ? 'File uploaded' : `${fileNames.length} files uploaded`,
     count: fileNames.length
   });
+}));
+
+app.post('/api/tasks/:id/files/notify-batch', requireAuth, asyncHandler(async (req, res) => {
+  const task = await fetchTask(Number(req.params.id));
+  if (!canViewTask(req.user, task)) return res.status(404).json({ message: 'Task not found' });
+
+  const count = Math.max(Number(req.body.count) || 0, 1);
+  await addHistory(task.id, req.user.id, count === 1 ? 'File uploaded' : 'Files uploaded', task.status, task.status, `${count} file${count === 1 ? '' : 's'}`);
+  await notifyUsers(
+    taskParticipantIds(task),
+    task.id,
+    count === 1 ? 'File uploaded' : 'Files uploaded',
+    `${req.user.name} uploaded ${count === 1 ? '1 file' : `${count} files`} for ${taskDisplayName(task)}.`,
+    'file_uploaded',
+    req.user.id
+  );
+  res.json({ message: 'Notified' });
 }));
 
 app.delete('/api/tasks/:taskId/files/:fileId', requireAuth, asyncHandler(async (req, res) => {

@@ -6,9 +6,13 @@
   "scripts": {
     "dev": "nodemon src/server.js",
     "start": "node src/server.js",
-    "fix:bd": "node scripts/fix-bd-user.js"
+    "fix:bd": "node scripts/fix-bd-user.js",
+    "cleanup:notifications": "node scripts/cleanup-notifications.js",
+    "sweep:orphaned-files": "node scripts/sweep-orphaned-space-files.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1116.0",
+    "@aws-sdk/lib-storage": "^3.1117.0",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",

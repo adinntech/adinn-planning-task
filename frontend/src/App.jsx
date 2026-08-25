@@ -33,7 +33,7 @@ import {
   XCircle
 } from 'lucide-react';
 import logo from './assets/adinn-logo.png';
-import { api, clearSession, fileUrl, getSavedUser, login } from './api';
+import { api, clearSession, fileUrl, getSavedUser, login, uploadWithProgress } from './api';
 
 const statuses = [
   'Pending Lead Assignment',
@@ -69,6 +69,46 @@ function formatDate(value) {
     year: 'numeric',
     ...(hasTime ? { hour: '2-digit', minute: '2-digit' } : {})
   });
+}
+
+const UPLOAD_CONCURRENCY = 3;
+const COMPRESSIBLE_IMAGE_TYPES = new Set(['image/jpeg', 'image/webp']);
+const IMAGE_COMPRESSION_MIN_SIZE = 800 * 1024;
+const IMAGE_MAX_DIMENSION = 2000;
+const IMAGE_JPEG_QUALITY = 0.8;
+
+// Shrinks large photos client-side before upload so the slow leg (client's own
+// upload bandwidth) has fewer bytes to push. PNG is only resized (lossless,
+// keeps transparency); JPEG/WEBP are also re-encoded at a lower quality.
+// Falls back to the original file on any error, or if compression didn't
+// actually make it smaller.
+async function compressImageFile(file) {
+  const isLossyCompressible = COMPRESSIBLE_IMAGE_TYPES.has(file.type) && file.size > IMAGE_COMPRESSION_MIN_SIZE;
+  const isResizablePng = file.type === 'image/png' && file.size > IMAGE_COMPRESSION_MIN_SIZE;
+  if (!isLossyCompressible && !isResizablePng) return file;
+
+  try {
+    const bitmap = await createImageBitmap(file);
+    const scale = Math.min(1, IMAGE_MAX_DIMENSION / Math.max(bitmap.width, bitmap.height));
+    if (isResizablePng && scale >= 1) return file;
+
+    const width = Math.round(bitmap.width * scale);
+    const height = Math.round(bitmap.height * scale);
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, width, height);
+    bitmap.close?.();
+
+    const blob = await new Promise(resolve => {
+      canvas.toBlob(resolve, file.type, file.type === 'image/png' ? undefined : IMAGE_JPEG_QUALITY);
+    });
+
+    if (!blob || blob.size >= file.size) return file;
+    return new File([blob], file.name, { type: file.type, lastModified: Date.now() });
+  } catch {
+    return file;
+  }
 }
 
 async function saveAttachmentToDevice(file) {
@@ -1333,6 +1373,11 @@ function AttachmentPreview({ file, onClose, onDownload, downloading }) {
   const [error, setError] = useState('');
   const [sheets, setSheets] = useState([]);
   const [activeSheet, setActiveSheet] = useState(0);
+  const [previewLoadFailed, setPreviewLoadFailed] = useState(false);
+
+  useEffect(() => {
+    setPreviewLoadFailed(false);
+  }, [file?.id]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1378,7 +1423,7 @@ function AttachmentPreview({ file, onClose, onDownload, downloading }) {
             <span>Uploaded by {file.name || 'User'}</span>
           </div>
           <div className="attachment-preview-actions">
-            {file.available && downloadUrl && (
+            {file.available && !previewLoadFailed && downloadUrl && (
               <button
                 type="button"
                 className="ghost-button"
@@ -1392,14 +1437,16 @@ function AttachmentPreview({ file, onClose, onDownload, downloading }) {
           </div>
         </header>
 
-        {!file.available ? (
+        {!file.available || previewLoadFailed ? (
           <div className="attachment-unavailable">
             <XCircle size={44} />
             <h3>File unavailable</h3>
             <p>{file.unavailable_reason || 'This file is no longer available. Please upload the original file again.'}</p>
           </div>
         ) : file.preview_kind === 'image' ? (
-          <div className="image-preview-stage"><img src={previewUrl} alt={file.file_name} /></div>
+          <div className="image-preview-stage">
+            <img src={previewUrl} alt={file.file_name} onError={() => setPreviewLoadFailed(true)} />
+          </div>
         ) : file.preview_kind === 'pdf' ? (
           <iframe className="document-preview-frame" src={previewUrl} title={file.file_name} />
         ) : file.preview_kind === 'presentation' ? (
@@ -1461,6 +1508,9 @@ function TaskDetail({ taskId, user, onClose, notify, onChanged }) {
   const [comment, setComment] = useState('');
   const [files, setFiles] = useState([]);
   const [uploadingFiles, setUploadingFiles] = useState(false);
+  const [uploadQueue, setUploadQueue] = useState([]);
+  const uploadAbortsRef = useRef({});
+  const uploadCancelledRef = useRef(new Set());
   const [deletingFileId, setDeletingFileId] = useState(null);
   const [previewFile, setPreviewFile] = useState(null);
   const [downloadingFileId, setDownloadingFileId] = useState(null);
@@ -1561,21 +1611,94 @@ function TaskDetail({ taskId, user, onClose, notify, onChanged }) {
     }
   }
 
+  function cancelQueuedUpload(itemId) {
+    uploadCancelledRef.current.add(itemId);
+    const controller = uploadAbortsRef.current[itemId];
+    if (controller) {
+      controller.abort();
+    } else {
+      // Still waiting for a free concurrency slot -- nothing to abort yet,
+      // just mark it so the worker skips it once its turn comes.
+      setUploadQueue(prev => prev.map(item => (item.id === itemId ? { ...item, status: 'cancelled' } : item)));
+    }
+  }
+
   async function uploadFile(event) {
     event.preventDefault();
     if (files.length === 0) return;
     const form = event.currentTarget;
-    const formData = new FormData();
-    files.forEach(file => formData.append('files', file));
     setUploadingFiles(true);
+    uploadCancelledRef.current = new Set();
+    uploadAbortsRef.current = {};
     try {
-      const result = await api(`/tasks/${task.id}/files`, { method: 'POST', body: formData });
+      const preparedFiles = await Promise.all(files.map(compressImageFile));
+      const queueItems = preparedFiles.map((file, index) => ({
+        id: `${Date.now()}-${index}`,
+        file,
+        name: file.name,
+        status: 'pending',
+        progress: 0
+      }));
+      setUploadQueue(queueItems);
+
+      const results = [];
+      let nextIndex = 0;
+      async function worker() {
+        while (nextIndex < queueItems.length) {
+          const item = queueItems[nextIndex];
+          nextIndex += 1;
+          if (uploadCancelledRef.current.has(item.id)) {
+            results.push({ id: item.id, status: 'cancelled' });
+            continue;
+          }
+          const controller = new AbortController();
+          uploadAbortsRef.current[item.id] = controller;
+          setUploadQueue(prev => prev.map(q => (q.id === item.id ? { ...q, status: 'uploading' } : q)));
+          try {
+            const formData = new FormData();
+            formData.append('files', item.file);
+            formData.append('silent', 'true');
+            await uploadWithProgress(`/tasks/${task.id}/files`, formData, {
+              signal: controller.signal,
+              onProgress: pct => {
+                // Cap at 99 while still uploading: 100 is reserved for the
+                // real "done" state (server confirmed), since bytes fully
+                // sent to the server doesn't mean it's finished storing yet.
+                setUploadQueue(prev => prev.map(q => (q.id === item.id ? { ...q, progress: Math.min(pct, 99) } : q)));
+              }
+            });
+            setUploadQueue(prev => prev.map(q => (q.id === item.id ? { ...q, status: 'done', progress: 100 } : q)));
+            results.push({ id: item.id, status: 'done' });
+          } catch (err) {
+            const cancelled = uploadCancelledRef.current.has(item.id) || err.message === 'Upload cancelled';
+            setUploadQueue(prev => prev.map(q => (q.id === item.id ? { ...q, status: cancelled ? 'cancelled' : 'error' } : q)));
+            results.push({ id: item.id, status: cancelled ? 'cancelled' : 'error', error: err.message });
+          } finally {
+            delete uploadAbortsRef.current[item.id];
+          }
+        }
+      }
+      const workerCount = Math.min(UPLOAD_CONCURRENCY, queueItems.length);
+      await Promise.all(Array.from({ length: workerCount }, worker));
+
+      const succeeded = results.filter(r => r.status === 'done').length;
+      const cancelled = results.filter(r => r.status === 'cancelled').length;
+      const failed = results.filter(r => r.status === 'error').length;
+
+      if (succeeded > 0) {
+        await api(`/tasks/${task.id}/files/notify-batch`, { method: 'POST', body: JSON.stringify({ count: succeeded }) });
+      }
+
+      const parts = [];
+      if (succeeded > 0) parts.push(`${succeeded} uploaded`);
+      if (failed > 0) parts.push(`${failed} failed`);
+      if (cancelled > 0) parts.push(`${cancelled} cancelled`);
+      notify(parts.join(', ') || 'No files uploaded.', failed > 0 ? 'error' : 'success');
+
       setFiles([]);
+      setUploadQueue([]);
       form.reset();
-      notify(result.message || `${files.length} file${files.length === 1 ? '' : 's'} uploaded.`);
-      await load();
-    } catch (err) {
-      notify(err.message, 'error');
+      if (succeeded > 0) await load();
     } finally {
       setUploadingFiles(false);
     }
@@ -1801,6 +1924,35 @@ function TaskDetail({ taskId, user, onClose, notify, onChanged }) {
                     {uploadingFiles ? 'Uploading...' : (files.length > 1 ? `Upload ${files.length} Files` : 'Upload')}
                   </button>
                 </form>
+                {uploadQueue.length > 0 && (
+                  <div className="upload-queue">
+                    {uploadQueue.map(item => (
+                      <div className={className('upload-queue-item', `upload-queue-${item.status}`)} key={item.id}>
+                        <span className="upload-queue-name">{item.name}</span>
+                        <div className="upload-queue-progress-track">
+                          <div className="upload-queue-progress-fill" style={{ width: `${item.status === 'pending' ? 0 : item.progress}%` }} />
+                        </div>
+                        <span className="upload-queue-status">
+                          {item.status === 'pending' && 'Pending'}
+                          {item.status === 'uploading' && `${item.progress}%`}
+                          {item.status === 'done' && 'Done'}
+                          {item.status === 'error' && 'Failed'}
+                          {item.status === 'cancelled' && 'Cancelled'}
+                        </span>
+                        {(item.status === 'pending' || item.status === 'uploading') && (
+                          <button
+                            type="button"
+                            className="upload-queue-cancel"
+                            onClick={() => cancelQueuedUpload(item.id)}
+                            title={`Cancel ${item.name}`}
+                          >
+                            <XCircle size={15} />
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
                 <div className="file-list">
                   {(data.files || []).map(item => (
                     <div className={className('file-item', !item.available && 'file-unavailable')} key={item.id}>

@@ -204,6 +204,21 @@ input:focus, select:focus, textarea:focus { border-color: rgba(237,0,16,.7); box
 .modal-columns { display: grid; grid-template-columns: 1.2fr .8fr; gap: 16px; }
 .comment-form, .upload-form { display: flex; gap: 10px; margin-bottom: 12px; }
 .comment-list, .file-list, .history-list { display: grid; gap: 10px; }
+.upload-queue { display: grid; gap: 8px; margin-bottom: 12px; }
+.upload-queue-item { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 6px 10px; border: 1px solid var(--panel-line); background: #f8fafc; border-radius: 12px; padding: 8px 12px; }
+.upload-queue-name { grid-column: 1 / 2; font-size: 13px; overflow-wrap: anywhere; }
+.upload-queue-status { grid-column: 2 / 3; font-size: 12px; color: var(--muted); min-width: 52px; text-align: right; }
+.upload-queue-cancel { grid-column: 3 / 4; grid-row: 1 / 2; width: 26px; height: 26px; border: none; background: transparent; color: var(--muted-2); display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+.upload-queue-cancel:hover { color: var(--red); }
+.upload-queue-progress-track { grid-column: 1 / 4; height: 6px; border-radius: 999px; background: var(--panel-soft); overflow: hidden; }
+.upload-queue-progress-fill { height: 100%; border-radius: 999px; background: var(--red); transition: width .2s ease; }
+.upload-queue-pending .upload-queue-progress-fill { background: var(--muted-2); }
+.upload-queue-done .upload-queue-progress-fill { background: var(--green); }
+.upload-queue-done .upload-queue-status { color: var(--green); }
+.upload-queue-error .upload-queue-progress-fill { background: var(--red); }
+.upload-queue-error .upload-queue-status { color: var(--red); }
+.upload-queue-cancelled .upload-queue-progress-fill { background: var(--muted-2); }
+.upload-queue-cancelled .upload-queue-status { color: var(--muted-2); }
 .comment-item { background: #f8fafc; border: 1px solid var(--panel-line); border-radius: 16px; padding: 14px; }
 .comment-item strong { display: flex; gap: 8px; align-items: center; }
 .comment-item strong span { color: var(--muted); font-size: 12px; text-transform: capitalize; }

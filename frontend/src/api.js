@@ -67,6 +67,42 @@ export async function api(path, options = {}) {
   return parseResponse(response, path);
 }
 
+export function uploadWithProgress(path, formData, { onProgress, signal } = {}) {
+  const token = getToken();
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${API_BASE}${path}`);
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+    xhr.upload.onprogress = event => {
+      if (onProgress && event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100));
+    };
+    xhr.onload = () => {
+      let data = {};
+      try { data = JSON.parse(xhr.responseText || '{}'); } catch { /* non-JSON response */ }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(data);
+        return;
+      }
+      const message = data.message || 'Something went wrong';
+      if (xhr.status === 401) {
+        clearSession();
+        window.dispatchEvent(new CustomEvent('adinn-auth-expired', { detail: { message } }));
+      }
+      reject(new Error(message));
+    };
+    xhr.onerror = () => reject(new Error('Network error while uploading'));
+    xhr.onabort = () => reject(new Error('Upload cancelled'));
+    if (signal) {
+      if (signal.aborted) {
+        xhr.abort();
+        return;
+      }
+      signal.addEventListener('abort', () => xhr.abort());
+    }
+    xhr.send(formData);
+  });
+}
+
 export async function login(email, password, rememberMe = false) {
   const data = await api('/auth/login', {
     method: 'POST',
