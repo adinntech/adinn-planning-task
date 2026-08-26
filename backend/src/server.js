@@ -29,6 +29,7 @@ const {
   TaskDecline,
   Notification
 } = require('./database');
+const { scheduleCronJobs } = require('./cron');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -2175,6 +2176,7 @@ app.use((err, _req, res, _next) => {
 
 async function start() {
   await initDb();
+  scheduleCronJobs();
   app.listen(PORT, () => {
     console.log(`ADINN Planning Task Manager API running on http://localhost:${PORT}`);
     console.log('Task attachments are stored in MongoDB GridFS (bucket: task_attachments)');
