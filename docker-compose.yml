@@ -1,0 +1,59 @@
+# ADINN Planning Task Manager: frontend (nginx + SPA) -> backend (Express) -> external MongoDB.
+# MongoDB is NOT run here; point MONGODB_URI (in .env) at your existing server.
+#
+#   cp .env.example .env   # then fill in real values
+#   docker compose build
+#   docker compose up -d
+
+name: adinn-planning
+
+services:
+  backend:
+    build:
+      context: ./backend
+    image: adinn-planning-backend:latest
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      # Fixed inside the container; change the host side with BACKEND_PORT.
+      PORT: "5001"
+      UPLOAD_DIR: /app/uploads
+    ports:
+      - "${BACKEND_BIND_ADDRESS:-0.0.0.0}:${BACKEND_PORT:-3001}:5001"
+    volumes:
+      # Upload staging + any legacy 'local' attachments served at /uploads.
+      - backend_uploads:/app/uploads
+    extra_hosts:
+      # Lets MONGODB_URI use host.docker.internal for a MongoDB on the Docker host
+      # (works on Docker Desktop and on Linux).
+      - "host.docker.internal:host-gateway"
+    networks:
+      - app
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: ${VITE_API_URL:-/api}
+    image: adinn-planning-frontend:latest
+    restart: unless-stopped
+    environment:
+      BACKEND_UPSTREAM: http://backend:5001
+      CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-300m}
+    ports:
+      - "${FRONTEND_BIND_ADDRESS:-0.0.0.0}:${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - app
+
+networks:
+  app:
+    driver: bridge
+
+volumes:
+  backend_uploads:
