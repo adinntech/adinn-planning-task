@@ -1661,7 +1661,7 @@ app.patch('/api/tasks/:id/reassign-lead', requireAuth, requireRole('admin', 'man
   res.json({ task: await fetchTask(task.id) });
 }));
 
-app.put('/api/tasks/:id/planner-assignments', requireAuth, requireRole('admin', 'manager', 'planning_lead'), asyncHandler(async (req, res) => {
+app.put('/api/tasks/:id/planner-assignments', requireAuth, requireRole('admin', 'planning_lead'), asyncHandler(async (req, res) => {
   const task = await fetchTask(Number(req.params.id));
   if (!canViewTask(req.user, task)) return res.status(404).json({ message: 'Task not found' });
   if (task.status === 'Completed') return res.status(400).json({ message: 'Completed tasks cannot be reassigned' });
@@ -1813,10 +1813,10 @@ async function replaceWithSinglePlanner(req, res) {
   return res.json({ task: refreshed });
 }
 
-app.patch('/api/tasks/:id/reassign-planner', requireAuth, requireRole('admin', 'manager', 'planning_lead'), asyncHandler(replaceWithSinglePlanner));
+app.patch('/api/tasks/:id/reassign-planner', requireAuth, requireRole('admin', 'planning_lead'), asyncHandler(replaceWithSinglePlanner));
 
 // Backward-compatible endpoint for older frontend deployments.
-app.patch('/api/tasks/:id/reassign', requireAuth, requireRole('admin', 'manager', 'planning_lead'), asyncHandler(replaceWithSinglePlanner));
+app.patch('/api/tasks/:id/reassign', requireAuth, requireRole('admin', 'planning_lead'), asyncHandler(replaceWithSinglePlanner));
 
 app.delete('/api/tasks/:id', requireAuth, requireRole('admin'), asyncHandler(async (req, res) => {
   const taskId = Number(req.params.id);
