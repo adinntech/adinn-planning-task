@@ -1661,7 +1661,7 @@ app.patch('/api/tasks/:id/reassign-lead', requireAuth, requireRole('admin', 'man
   res.json({ task: await fetchTask(task.id) });
 }));
 
-app.put('/api/tasks/:id/planner-assignments', requireAuth, requireRole('admin', 'planning_lead'), asyncHandler(async (req, res) => {
+app.put('/api/tasks/:id/planner-assignments', requireAuth, requireRole('admin', 'manager', 'planning_lead'), asyncHandler(async (req, res) => {
   const task = await fetchTask(Number(req.params.id));
   if (!canViewTask(req.user, task)) return res.status(404).json({ message: 'Task not found' });
   if (task.status === 'Completed') return res.status(400).json({ message: 'Completed tasks cannot be reassigned' });

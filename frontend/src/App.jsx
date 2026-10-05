@@ -1871,7 +1871,7 @@ function TaskDetail({ taskId, user, onClose, notify, onChanged }) {
                     </div>
                   )}
 
-                  {task.status !== 'Completed' && ['admin', 'planning_lead'].includes(user.role) && (
+                  {task.status !== 'Completed' && ['admin', 'manager', 'planning_lead'].includes(user.role) && (
                     <div className="multi-planner-management">
                       <div className="multi-planner-management-head">
                         <div>
