@@ -9,7 +9,7 @@ const multer = require('multer');
 const ExcelJS = require('exceljs');
 const { S3Client, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { Upload } = require('@aws-sdk/lib-storage');
-require('dotenv').config();
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 const {
   mongoose,
@@ -405,6 +405,21 @@ function taskDisplayName(task) {
   return task.brand_name || task.title || task.task_code || 'Planning task';
 }
 
+const PLAN_FILE_PATTERN = /\.(pptx?|xlsx?|xlsm|csv)$/i;
+
+// Title + message for a file-upload notification. PPT/Excel uploads are the
+// actual plan deliverables BDs wait on, so they get a distinct "Plan uploaded" title.
+function fileUploadNotice(uploaderName, task, fileNames, count = fileNames.length) {
+  const isPlan = fileNames.some(name => PLAN_FILE_PATTERN.test(name));
+  const what = fileNames.length === 1
+    ? fileNames[0]
+    : fileNames.length > 1 ? `${fileNames.length} files (${fileNames.join(', ')})` : `${count} file${count === 1 ? '' : 's'}`;
+  return {
+    title: isPlan ? 'Plan uploaded' : (count === 1 ? 'File uploaded' : 'Files uploaded'),
+    message: `${uploaderName} uploaded ${what} for ${taskDisplayName(task)}.`
+  };
+}
+
 async function createNotification(userId, taskId, title, message, type = 'task_update') {
   if (!userId) return;
   const id = await nextId('notifications');
@@ -420,8 +435,26 @@ async function createNotification(userId, taskId, title, message, type = 'task_u
   });
 }
 
+// Task-wide progress events that every active admin also receives, so admins
+// can follow all tasks without being a participant. Person-specific notices
+// ("assigned to you", "removed you") are deliberately left out — their wording
+// only makes sense for the addressed user.
+const ADMIN_FEED_TYPES = new Set([
+  'comment_added',
+  'file_uploaded',
+  'file_deleted',
+  'task_accepted',
+  'task_declined',
+  'status_updated',
+  'conversion_status_updated',
+  'planning_lead_reassigned'
+]);
+
 async function notifyUsers(userIds, taskId, title, message, type = 'task_update', excludeUserId = null) {
-  const recipients = uniqueIds(userIds).filter(id => id !== Number(excludeUserId));
+  const adminIds = ADMIN_FEED_TYPES.has(type)
+    ? (await User.find({ role: 'admin', status: 'active' }).select('_id').lean()).map(u => u._id)
+    : [];
+  const recipients = uniqueIds([...userIds, ...adminIds]).filter(id => id !== Number(excludeUserId));
   for (const userId of recipients) {
     await createNotification(userId, taskId, title, message, type);
   }
@@ -966,14 +999,20 @@ app.get('/api/tasks', requireAuth, asyncHandler(async (req, res) => {
     }
   }
   if (view === 'active') {
+    // Cancelled tasks drop out of the active queue and live in their own
+    // Cancelled section (view=cancelled).
     if (req.user.role === 'planner') {
       const completedIds = await TaskPlannerAssignment.find({ planner_id: req.user.id, status: 'Completed' }).distinct('task_id');
       andConditions.push({ _id: { $nin: completedIds } });
+      andConditions.push({ status: { $ne: 'Cancelled' } });
     } else {
-      filter.status = { $ne: 'Completed' };
+      filter.status = { $nin: ['Completed', 'Cancelled'] };
     }
   }
-  if (status && status !== 'all') filter.status = status;
+  if (view === 'cancelled') {
+    filter.status = 'Cancelled';
+  }
+  if (status && status !== 'all' && view !== 'cancelled') filter.status = status;
   if (priority && priority !== 'all') filter.priority = priority;
   if (assigned_to && assigned_to !== 'all') {
     const ids = await TaskPlannerAssignment.find({ planner_id: Number(assigned_to) }).distinct('task_id');
@@ -1007,7 +1046,7 @@ app.get('/api/tasks', requireAuth, asyncHandler(async (req, res) => {
   const assignmentsByTask = await fetchAssignmentsForTasks(taskIds);
   let tasks = await attachTaskDetailsBatch(taskDocs, assignmentsByTask);
 
-  if (view === 'completed') {
+  if (view === 'completed' || view === 'cancelled') {
     // Newest submission deadline first (matches the "Submission Deadline" column
     // shown on the Completed page), falling back to completion/update time when
     // a task has no deadline recorded. Legacy records store this in inconsistent
@@ -1363,14 +1402,8 @@ app.post('/api/tasks/:id/files', requireAuth, upload.fields([
   if (req.body.silent !== 'true') {
     const summary = fileNames.length === 1 ? fileNames[0] : `${fileNames.length} files: ${fileNames.join(', ')}`;
     await addHistory(task.id, req.user.id, fileNames.length === 1 ? 'File uploaded' : 'Files uploaded', task.status, task.status, summary);
-    await notifyUsers(
-      taskParticipantIds(task),
-      task.id,
-      fileNames.length === 1 ? 'File uploaded' : 'Files uploaded',
-      `${req.user.name} uploaded ${fileNames.length === 1 ? fileNames[0] : `${fileNames.length} files`} for ${taskDisplayName(task)}.`,
-      'file_uploaded',
-      req.user.id
-    );
+    const notice = fileUploadNotice(req.user.name, task, fileNames);
+    await notifyUsers(taskParticipantIds(task), task.id, notice.title, notice.message, 'file_uploaded', req.user.id);
   }
   res.status(201).json({
     message: fileNames.length === 1 ? 'File uploaded' : `${fileNames.length} files uploaded`,
@@ -1382,16 +1415,14 @@ app.post('/api/tasks/:id/files/notify-batch', requireAuth, asyncHandler(async (r
   const task = await fetchTask(Number(req.params.id));
   if (!canViewTask(req.user, task)) return res.status(404).json({ message: 'Task not found' });
 
-  const count = Math.max(Number(req.body.count) || 0, 1);
-  await addHistory(task.id, req.user.id, count === 1 ? 'File uploaded' : 'Files uploaded', task.status, task.status, `${count} file${count === 1 ? '' : 's'}`);
-  await notifyUsers(
-    taskParticipantIds(task),
-    task.id,
-    count === 1 ? 'File uploaded' : 'Files uploaded',
-    `${req.user.name} uploaded ${count === 1 ? '1 file' : `${count} files`} for ${taskDisplayName(task)}.`,
-    'file_uploaded',
-    req.user.id
-  );
+  const fileNames = Array.isArray(req.body.file_names)
+    ? req.body.file_names.map(name => String(name).slice(0, 255)).slice(0, 50)
+    : [];
+  const count = Math.max(Number(req.body.count) || 0, fileNames.length, 1);
+  const summary = fileNames.length ? fileNames.join(', ') : `${count} file${count === 1 ? '' : 's'}`;
+  await addHistory(task.id, req.user.id, count === 1 ? 'File uploaded' : 'Files uploaded', task.status, task.status, summary);
+  const notice = fileUploadNotice(req.user.name, task, fileNames, count);
+  await notifyUsers(taskParticipantIds(task), task.id, notice.title, notice.message, 'file_uploaded', req.user.id);
   res.json({ message: 'Notified' });
 }));
 

@@ -206,10 +206,17 @@ function NotificationBell({ onOpenTask, onViewAll, refreshKey, notify }) {
   const [items, setItems] = useState([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const lastSeenIdRef = useRef(null);
+  const [desktopPermission, setDesktopPermission] = useState(typeof Notification === 'undefined' ? 'unsupported' : Notification.permission);
+
+  async function enableDesktopAlerts() {
+    if (typeof Notification === 'undefined') return;
+    const result = await Notification.requestPermission();
+    setDesktopPermission(result);
+  }
 
   useEffect(() => {
     if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
-      Notification.requestPermission();
+      Notification.requestPermission().then(setDesktopPermission);
     }
   }, []);
 
@@ -246,7 +253,7 @@ function NotificationBell({ onOpenTask, onViewAll, refreshKey, notify }) {
 
   useEffect(() => {
     load();
-    const timer = window.setInterval(load, 60000);
+    const timer = window.setInterval(load, 30000);
     return () => window.clearInterval(timer);
   }, [refreshKey]);
 
@@ -313,6 +320,14 @@ function NotificationBell({ onOpenTask, onViewAll, refreshKey, notify }) {
             </div>
             <button onClick={markAllRead} disabled={!unreadCount}><CheckCheck size={15} /> Mark all</button>
           </div>
+          {desktopPermission === 'default' && (
+            <div className="notification-empty">
+              <button className="ghost-button" onClick={enableDesktopAlerts}><Bell size={15} /> Enable desktop alerts</button>
+            </div>
+          )}
+          {desktopPermission === 'denied' && (
+            <div className="notification-empty">Desktop alerts are blocked. Allow notifications for this site in your browser settings (lock icon in the address bar).</div>
+          )}
           <div className="notification-list">
             {loading && items.length === 0 ? <div className="notification-empty">Loading notifications...</div> : null}
             {!loading && items.length === 0 ? <div className="notification-empty">No notifications yet.</div> : null}
@@ -588,6 +603,7 @@ function Shell({ user, activeView, setActiveView, onLogout, onOpenTask, refreshK
     { key: 'tasks', label: user.role === 'planner' ? 'My Tasks' : 'All Tasks', icon: ClipboardList, roles: ['admin', 'manager', 'planning_lead', 'planner'] },
     { key: 'other_tasks', label: 'Others Tasks', icon: Users, roles: ['planner'] },
     { key: 'completed', label: 'Completed', icon: CheckCircle2, roles: ['admin', 'manager', 'planning_lead', 'planner'] },
+    { key: 'cancelled', label: 'Cancelled', icon: XCircle, roles: ['admin', 'manager', 'planning_lead', 'planner'] },
     { key: 'notifications', label: 'Notification', icon: Bell, roles: ['admin', 'manager', 'planning_lead', 'planner'] },
     { key: 'create', label: 'Create Task', icon: Plus, roles: ['admin', 'manager', 'planning_lead'] },
     { key: 'reports', label: 'Reports', icon: BarChart3, roles: ['admin', 'manager', 'planning_lead', 'planner'] },
@@ -650,7 +666,7 @@ function Dashboard({ user, setActiveView, onOpenTask, notify, refreshKey }) {
         api(`/tasks?view=active${user.role === 'planner' ? '&scope=assigned' : ''}`)
       ]);
       setOverview(reportData);
-      setTasks(taskData.tasks || []);
+      setTasks((taskData.tasks || []).filter(task => task.status !== 'Cancelled'));
     } catch (err) {
       notify(err.message, 'error');
     } finally {
@@ -778,7 +794,7 @@ function TaskFilters({ filters, setFilters, planners, managers, user, showStatus
       {showStatus && (
         <select value={filters.status} onChange={e => setFilters({ ...filters, status: e.target.value })}>
           <option value="all">All statuses</option>
-          {statuses.filter(status => status !== 'Completed').map(status => <option key={status}>{status}</option>)}
+          {statuses.filter(status => !['Completed', 'Cancelled'].includes(status)).map(status => <option key={status}>{status}</option>)}
         </select>
       )}
       <select value={filters.plan_format} onChange={e => setFilters({ ...filters, plan_format: e.target.value })}>
@@ -994,8 +1010,16 @@ function TaskListTable({
   );
 }
 
-function TasksPage({ user, onOpenTask, notify, refreshKey, completedOnly = false, plannerScope = 'mine' }) {
-  const [tasks, setTasks] = useState([]);
+function sortNewestFirst(list) {
+  const stamp = task => {
+    const parsed = new Date(task.submission_deadline || task.due_date || task.updated_at || task.created_at || '').getTime();
+    return Number.isNaN(parsed) ? -Infinity : parsed;
+  };
+  return [...list].sort((a, b) => (stamp(b) - stamp(a)) || (Number(b.id) - Number(a.id)));
+}
+
+function TasksPage({ user, onOpenTask, notify, refreshKey, completedOnly = false, cancelledOnly = false, plannerScope = 'mine' }) {
+  const [allTasks, setTasks] = useState([]);
   const [planners, setPlanners] = useState([]);
   const [creators, setCreators] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -1007,7 +1031,7 @@ function TasksPage({ user, onOpenTask, notify, refreshKey, completedOnly = false
     setLoading(true);
     try {
       const queryParams = new URLSearchParams(Object.entries(filters).filter(([, v]) => v && v !== 'all'));
-      queryParams.set('view', completedOnly ? 'completed' : 'active');
+      queryParams.set('view', completedOnly ? 'completed' : (cancelledOnly ? 'cancelled' : 'active'));
       const query = queryParams.toString();
       const [taskData, userData] = await Promise.all([
         api(`/tasks?${query}`),
@@ -1023,13 +1047,21 @@ function TasksPage({ user, onOpenTask, notify, refreshKey, completedOnly = false
     }
   }
 
-  useEffect(() => { load(); }, [filters, refreshKey, completedOnly]);
-  useEffect(() => { setPage(1); }, [filters, completedOnly, plannerScope, pageSize]);
+  useEffect(() => { load(); }, [filters, refreshKey, completedOnly, cancelledOnly]);
+  useEffect(() => { setPage(1); }, [filters, completedOnly, cancelledOnly, plannerScope, pageSize]);
+
+  // The server already sends the matching view, sorted; this guard keeps the
+  // sections correct even against an older backend that doesn't know about
+  // view=cancelled or still returns cancelled tasks in the active view.
+  const tasks = cancelledOnly
+    ? sortNewestFirst(allTasks.filter(task => task.status === 'Cancelled'))
+    : (completedOnly ? allTasks : allTasks.filter(task => task.status !== 'Cancelled'));
 
   const myTasks = user.role === 'planner'
     ? tasks.filter(task => {
         const isMine = ((task.planner_ids || []).map(Number).includes(Number(user.id)) || Number(task.assigned_to) === Number(user.id)) && !task.is_summary_only;
         if (!isMine) return false;
+        if (cancelledOnly) return task.status === 'Cancelled';
         const ownStatus = task.my_assignment_status || task.status;
         return completedOnly ? ownStatus === 'Completed' : ownStatus !== 'Completed';
       })
@@ -1042,7 +1074,7 @@ function TasksPage({ user, onOpenTask, notify, refreshKey, completedOnly = false
     : [];
 
   async function updateConversionStatus(taskId, conversionStatus) {
-    const previousTasks = tasks;
+    const previousTasks = allTasks;
     setTasks(current => current.map(task => (
       Number(task.id) === Number(taskId)
         ? { ...task, conversion_status: conversionStatus }
@@ -1064,12 +1096,12 @@ function TasksPage({ user, onOpenTask, notify, refreshKey, completedOnly = false
     <section className="panel full-panel">
       <div className="panel-title">
         <div>
-          <p className="eyebrow">{completedOnly ? 'Completed archive' : 'Task tracker'}</p>
-          <h2>{completedOnly ? 'Completed Tasks' : (user.role === 'planner' ? (plannerScope === 'others' ? 'Others Tasks' : 'My Tasks') : 'Planning Work Allocation')}</h2>
+          <p className="eyebrow">{completedOnly ? 'Completed archive' : (cancelledOnly ? 'Cancelled archive' : 'Task tracker')}</p>
+          <h2>{completedOnly ? 'Completed Tasks' : (cancelledOnly ? 'Cancelled Tasks' : (user.role === 'planner' ? (plannerScope === 'others' ? 'Others Tasks' : 'My Tasks') : 'Planning Work Allocation'))}</h2>
         </div>
         <button className="ghost-button" onClick={load}><RefreshCw size={16} /> Refresh</button>
       </div>
-      <TaskFilters filters={filters} setFilters={setFilters} planners={planners} managers={creators} user={user} showStatus={!completedOnly} />
+      <TaskFilters filters={filters} setFilters={setFilters} planners={planners} managers={creators} user={user} showStatus={!completedOnly && !cancelledOnly} />
       {loading ? <div className="loading-card">Loading tasks...</div> : user.role === 'planner' ? (
         <div className="planner-task-sections">
           {plannerScope === 'others' ? (
@@ -1096,12 +1128,12 @@ function TasksPage({ user, onOpenTask, notify, refreshKey, completedOnly = false
               <div className="task-list-section-title">
                 <div>
                   <p className="eyebrow">Your workload</p>
-                  <h3>{completedOnly ? 'My Completed Tasks' : 'My Tasks'}</h3>
+                  <h3>{completedOnly ? 'My Completed Tasks' : (cancelledOnly ? 'My Cancelled Tasks' : 'My Tasks')}</h3>
                 </div>
                 <Pill>{myTasks.length}</Pill>
               </div>
               {myTasks.length === 0
-                ? <EmptyState title={completedOnly ? 'No completed tasks assigned to you' : 'No tasks assigned to you'} text="Your assigned planning tasks will appear here." />
+                ? <EmptyState title={completedOnly ? 'No completed tasks assigned to you' : (cancelledOnly ? 'No cancelled tasks assigned to you' : 'No tasks assigned to you')} text="Your assigned planning tasks will appear here." />
                 : (
                   <>
                     <TaskListTable tasks={paginate(myTasks, page, pageSize)} onOpenTask={onOpenTask} completedOnly={completedOnly} user={user} onConversionChange={updateConversionStatus} />
@@ -1113,8 +1145,8 @@ function TasksPage({ user, onOpenTask, notify, refreshKey, completedOnly = false
         </div>
       ) : tasks.length === 0 ? (
         <EmptyState
-          title={completedOnly ? 'No completed tasks found' : 'No active tasks found'}
-          text={completedOnly ? 'Tasks marked Completed will appear in this section.' : 'Create a new request or adjust your filters.'}
+          title={completedOnly ? 'No completed tasks found' : (cancelledOnly ? 'No cancelled tasks found' : 'No active tasks found')}
+          text={completedOnly ? 'Tasks marked Completed will appear in this section.' : (cancelledOnly ? 'Tasks marked Cancelled will appear in this section.' : 'Create a new request or adjust your filters.')}
         />
       ) : (
         <>
@@ -1668,7 +1700,7 @@ function TaskDetail({ taskId, user, onClose, notify, onChanged }) {
               }
             });
             setUploadQueue(prev => prev.map(q => (q.id === item.id ? { ...q, status: 'done', progress: 100 } : q)));
-            results.push({ id: item.id, status: 'done' });
+            results.push({ id: item.id, name: item.name, status: 'done' });
           } catch (err) {
             const cancelled = uploadCancelledRef.current.has(item.id) || err.message === 'Upload cancelled';
             setUploadQueue(prev => prev.map(q => (q.id === item.id ? { ...q, status: cancelled ? 'cancelled' : 'error' } : q)));
@@ -1686,7 +1718,8 @@ function TaskDetail({ taskId, user, onClose, notify, onChanged }) {
       const failed = results.filter(r => r.status === 'error').length;
 
       if (succeeded > 0) {
-        await api(`/tasks/${task.id}/files/notify-batch`, { method: 'POST', body: JSON.stringify({ count: succeeded }) });
+        const fileNames = results.filter(r => r.status === 'done').map(r => r.name);
+        await api(`/tasks/${task.id}/files/notify-batch`, { method: 'POST', body: JSON.stringify({ count: succeeded, file_names: fileNames }) });
       }
 
       const parts = [];
@@ -2365,6 +2398,7 @@ export default function App() {
         {activeView === 'tasks' && <TasksPage user={user} onOpenTask={setSelectedTask} notify={notify} refreshKey={refreshKey} plannerScope="mine" />}
         {activeView === 'other_tasks' && <TasksPage user={user} onOpenTask={setSelectedTask} notify={notify} refreshKey={refreshKey} plannerScope="others" />}
         {activeView === 'completed' && <TasksPage user={user} onOpenTask={setSelectedTask} notify={notify} refreshKey={refreshKey} completedOnly plannerScope="mine" />}
+        {activeView === 'cancelled' && <TasksPage user={user} onOpenTask={setSelectedTask} notify={notify} refreshKey={refreshKey} cancelledOnly plannerScope="mine" />}
         {activeView === 'create' && <CreateTask user={user} notify={notify} setActiveView={setActiveView} onCreated={changed} />}
         {activeView === 'reports' && <Reports notify={notify} />}
         {activeView === 'notifications' && <NotificationsPage onOpenTask={setSelectedTask} notify={notify} refreshKey={refreshKey} />}
