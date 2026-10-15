@@ -16,7 +16,7 @@
 //   node scripts/cleanup-notifications.js --days=60                (date mode, custom cutoff)
 //
 // This script does nothing on its own — it only runs when invoked manually.
-// dummy commit #1
+// dummy commit #2
 
 const { initDb, Notification, mongoose } = require('../src/database');
 
